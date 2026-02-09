@@ -352,6 +352,7 @@ static void* client_thread_main(void* arg) {
         int src, dst;
         int edge_id;
         double speed;
+        double position;
 
         if (sscanf(line, "REQ %d %d", &src, &dst) == 2) {
             t->type = TASK_REQ;
@@ -360,7 +361,7 @@ static void* client_thread_main(void* arg) {
 
             queue_push(&st->routing_q, t);
 
-        } else if (sscanf(line, "UPD %d %lf", &edge_id, &speed) == 2) {
+        } else if (sscanf(line, "UPD %d %lf %lf", &edge_id, &speed, &position) >= 2) {
             t->type = TASK_UPD;
             t->edge_id = edge_id;
             t->speed = speed;

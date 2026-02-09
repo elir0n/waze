@@ -1,17 +1,19 @@
 # 🚗 Concurrent Routing Server (Waze)
 
 A multithreaded routing server written in **C**, inspired by Waze-style navigation systems.
-The server maintains a directed road graph, supports concurrent clients, and computes shortest paths using the **A\*** algorithm while dynamically adapting to traffic updates.
+The server maintains a directed road graph, supports concurrent clients, computes shortest paths using **A\***, and adapts travel times in real time using traffic reports.
+It also includes a CLI simulation and interactive client that act as real users: requesting routes, moving across edges, and sending periodic traffic updates.
 
 ---
 
 ## ✨ Features
 
-- ⚡ **Concurrent TCP server** (one thread per client)
-- 🧭 **A* shortest-path routing** with geometric heuristic
-- 🚦 **Live traffic updates** using Exponential Moving Average (EMA)
-- 🔐 **Thread-safe graph** access with reader–writer locks
-- 🧪 **Synthetic graph generation** for scalable testing
+- ⚡ **Concurrent TCP server** (thread-per-client)
+- 🧭 **A\*** routing with geometric heuristic
+- 🚦 **Live traffic updates** with EMA smoothing
+- 🔐 **Thread-safe graph access** with read/write locks
+- 🚗 **CLI simulation** with parallel cars + traffic reporting
+- 🧪 **Synthetic graph generator** for scalable testing
 - 📈 **Parallel load testing client**
 
 ---
@@ -32,6 +34,7 @@ The server maintains a directed road graph, supports concurrent clients, and com
 │   ├── nodes.csv
 │   └── edges.csv
 ├── generate_graph.py        # Synthetic graph generator
+├── cli_sim.py               # CLI simulation + interactive client
 ├── load_test.py             # Parallel load testing client
 ├── Makefile
 └── README.md
@@ -41,7 +44,7 @@ The server maintains a directed road graph, supports concurrent clients, and com
 
 ---
 
-## 🛠️ Compilation & Execution
+## 🛠️ Build & Run
 
 From the project root:
 
@@ -50,14 +53,14 @@ make
 ./server
 ```
 
-Or simply:
+Or:
 
 ```bash
 make run
 ```
 
-- 📡 The server listens on **TCP port 8080**
-- 📂 Graph data is loaded from the `data/` directory at startup
+- The server listens on **TCP port 8080**
+- Graph data is loaded from the `data/` directory
 
 ---
 
@@ -84,13 +87,13 @@ node_id,x,y
 edge_id,from_node,to_node,base_length,base_speed_limit
 ```
 
-The graph is directed. Node coordinates are used for the A* heuristic.
+The graph is **directed**. Node coordinates are used for the A* heuristic.
 
 ---
 
 ## 🧬 Generating Graph Data
 
-A Python script is provided to generate synthetic graphs for testing.
+A Python script is provided to generate synthetic graphs.
 
 Example (1000 nodes, 3000 edges):
 
@@ -104,8 +107,7 @@ This generates `graph.meta`, `nodes.csv`, and `edges.csv` directly in the `data/
 
 ## 🔌 Client Protocol
 
-The server uses a simple **line-based TCP protocol**.
-Clients may connect using standard tools such as `nc` (netcat):
+The server uses a simple **line-based TCP protocol**. Both `cli_sim.py` (simulation + interactive client) and `load_test.py` use this same protocol. You can also connect manually using `nc` (netcat):
 
 ```bash
 nc 127.0.0.1 8080
@@ -135,6 +137,12 @@ ERR NO_ROUTE
 UPD <edge_id> <speed>
 ```
 
+Optional (position on edge, 0.0–1.0):
+
+```
+UPD <edge_id> <speed> <position>
+```
+
 Response:
 
 ```
@@ -156,6 +164,33 @@ This allows:
 
 - Multiple routing queries to run in parallel
 - Safe and consistent traffic updates
+
+---
+
+## 🚗 Simulation (CLI)
+
+The simulation spawns multiple cars, each with its own TCP connection, and runs a discrete-time loop. Cars request routes, move along edges, and periodically report traffic updates.
+
+Run the server (in one terminal):
+
+```bash
+make
+./server
+```
+
+Run the simulation (in another terminal):
+
+```bash
+python3 cli_sim.py --mode sim --cars 20 --steps 200
+```
+
+Interactive routing (manual REQ):
+
+```bash
+python3 cli_sim.py --mode interactive
+```
+
+At the end of simulation mode, a short summary is printed (arrived/driving/waiting and average drive/wait steps).
 
 ---
 
