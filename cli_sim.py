@@ -207,6 +207,16 @@ def request_route(sock: socket.socket, src: int, dst: int) -> Tuple[bool, Option
         return False, None
     return True, parse_route(resp)
 
+def request_pred(sock: socket.socket, edge_id: int) -> Tuple[bool, Optional[float]]:
+    send_line(sock, f"PRED {edge_id}")
+    resp = recv_line(sock).strip()
+    if resp.startswith("ERR "):
+        return False, None
+    parts = resp.split()
+    if len(parts) != 3 or parts[0] != "PRED":
+        return False, None
+    return True, float(parts[2])
+
 
 def send_update(sock: socket.socket, edge_id: int, speed: float) -> bool:
     send_line(sock, f"UPD {edge_id} {speed:.3f}")
@@ -359,9 +369,25 @@ def interactive_mode(args: argparse.Namespace) -> None:
     with sock:
         print(f"Graph nodes: 0..{num_nodes - 1}")
         while True:
-            raw = input("Enter src dst (or 'q'): ").strip()
+            raw = input("Enter src dst, or 'pred <edge_id>', or 'q': ").strip()
             if raw.lower() in ("q", "quit", "exit"):
                 break
+            if raw.lower().startswith("pred "):
+                parts = raw.split()
+                if len(parts) != 2:
+                    print("Usage: pred <edge_id>")
+                    continue
+                try:
+                    edge_id = int(parts[1])
+                except ValueError:
+                    print("Invalid edge_id.")
+                    continue
+                ok, pred = request_pred(sock, edge_id)
+                if not ok or pred is None:
+                    print("ERR PRED")
+                else:
+                    print(f"Predicted travel time: {pred:.3f}")
+                continue
             parts = raw.split()
             if len(parts) != 2:
                 print("Please enter two integers: <src> <dst>")

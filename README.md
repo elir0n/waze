@@ -1,7 +1,7 @@
 # 🚗 Concurrent Routing Server (Waze)
 
 A multithreaded routing server written in **C**, inspired by Waze-style navigation systems.
-The server maintains a directed road graph, supports concurrent clients, computes shortest paths using **A\***, and adapts travel times in real time using traffic reports.
+The server maintains a directed road graph, supports concurrent clients, computes shortest paths using **A\***, adapts travel times in real time using traffic reports, and serves a simple heuristic traffic prediction.
 It also includes a CLI simulation and interactive client that act as real users: requesting routes, moving across edges, and sending periodic traffic updates.
 
 ---
@@ -11,6 +11,7 @@ It also includes a CLI simulation and interactive client that act as real users:
 - ⚡ **Concurrent TCP server** (thread-per-client)
 - 🧭 **A\*** routing with geometric heuristic
 - 🚦 **Live traffic updates** with EMA smoothing
+- 🔮 **Heuristic traffic prediction** (EMA-based)
 - 🔐 **Thread-safe graph access** with read/write locks
 - 🚗 **CLI simulation** with parallel cars + traffic reporting
 - 🧪 **Synthetic graph generator** for scalable testing
@@ -151,6 +152,20 @@ ACK
 
 Traffic updates adjust the travel time using an **EMA**.
 
+### 🔮 Traffic Prediction (Heuristic)
+
+```
+PRED <edge_id>
+```
+
+Response:
+
+```
+PRED <edge_id> <predicted_travel_time>
+```
+
+The prediction is a simple heuristic: the server returns the edge’s EMA travel time (or the current travel time if there is no history).
+
 ---
 
 ## 🧵 Concurrency Model
@@ -188,6 +203,12 @@ Interactive routing (manual REQ):
 
 ```bash
 python3 cli_sim.py --mode interactive
+```
+
+Interactive prediction:
+
+```
+pred <edge_id>
 ```
 
 At the end of simulation mode, a short summary is printed (arrived/driving/waiting and average drive/wait steps).

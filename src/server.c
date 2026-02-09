@@ -69,7 +69,8 @@ static int send_all(int client_fd, const char* s) {
 
 typedef enum {
     TASK_REQ = 1,
-    TASK_UPD = 2
+    TASK_UPD = 2,
+    TASK_PRED = 3
 } TaskType;
 
 typedef struct Task {
@@ -87,6 +88,9 @@ typedef struct Task {
     /* UPD payload */
     int edge_id;
     double speed;
+
+    /* PRED payload */
+    int pred_edge_id;
 
     /* result */
     char* response;     /* malloc'ed string to send back */
@@ -267,6 +271,19 @@ static char* apply_update(Graph* g, int edge_id, double speed) {
     return strdup("ACK\n");
 }
 
+static char* build_pred_response(Graph* g, int edge_id) {
+    if (edge_id < 0 || edge_id >= g->num_edges) {
+        return strdup("ERR BAD_EDGE\n");
+    }
+    Edge* e = &g->edges[edge_id];
+    double pred = (e->observation_count > 0) ? e->ema_travel_time : e->current_travel_time;
+
+    char* resp = (char*)malloc(64);
+    if (!resp) return strdup("ERR NO_MEM\n");
+    snprintf(resp, 64, "PRED %d %.3f\n", edge_id, pred);
+    return resp;
+}
+
 /* ---------------- server shared state ---------------- */
 
 typedef struct {
@@ -287,9 +304,16 @@ static void* routing_worker_main(void* arg) {
 
     while (1) {
         Task* t = queue_pop(&st->routing_q);
-        /* Execute REQ under read lock */
+        /* Execute REQ/PRED under read lock */
         pthread_rwlock_rdlock(&st->graph_lock);
-        char* resp = build_route_response(st->g, t->src, t->dst);
+        char* resp = NULL;
+        if (t->type == TASK_REQ) {
+            resp = build_route_response(st->g, t->src, t->dst);
+        } else if (t->type == TASK_PRED) {
+            resp = build_pred_response(st->g, t->pred_edge_id);
+        } else {
+            resp = strdup("ERR INTERNAL\n");
+        }
         pthread_rwlock_unlock(&st->graph_lock);
 
         task_complete(t, resp);
@@ -367,6 +391,12 @@ static void* client_thread_main(void* arg) {
             t->speed = speed;
 
             queue_push(&st->traffic_q, t);
+
+        } else if (sscanf(line, "PRED %d", &edge_id) == 1) {
+            t->type = TASK_PRED;
+            t->pred_edge_id = edge_id;
+
+            queue_push(&st->routing_q, t);
 
         } else {
             task_destroy(t);
