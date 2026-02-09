@@ -19,6 +19,9 @@ int find_route_a_star_path(Graph* graph,
                            double* out_cost,
                            int* out_edges,
                            int max_edges,
-                           int* out_edge_count);
+                           int* out_edge_count,
+                           int* out_nodes,
+                           int max_nodes,
+                           int* out_node_count);
 
 #endif

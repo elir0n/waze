@@ -32,13 +32,25 @@ def recv_line(sock: socket.socket) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 def parse_route(resp: str) -> Tuple[float, int, List[int]]:
-    # ROUTE <cost> <edge_count> <edge_ids...>
     parts = resp.strip().split()
-    if len(parts) < 3 or parts[0] != "ROUTE":
+    if len(parts) < 3:
         raise ValueError(f"Not a ROUTE response: {resp!r}")
-    cost = float(parts[1])
-    edge_count = int(parts[2])
-    edge_ids = [int(x) for x in parts[3:]]
+
+    if parts[0] == "ROUTE":
+        cost = float(parts[1])
+        edge_count = int(parts[2])
+        edge_ids = [int(x) for x in parts[3:]]
+    elif parts[0] == "ROUTE2":
+        cost = float(parts[1])
+        node_count = int(parts[2])
+        idx_edges = 3 + node_count
+        if idx_edges >= len(parts):
+            raise ValueError(f"ROUTE2 missing edge_count: {resp!r}")
+        edge_count = int(parts[idx_edges])
+        edge_ids = [int(x) for x in parts[idx_edges + 1 :]]
+    else:
+        raise ValueError(f"Not a ROUTE response: {resp!r}")
+
     if len(edge_ids) != edge_count:
         raise ValueError(f"edge_count mismatch: declared={edge_count} got={len(edge_ids)} resp={resp!r}")
     return cost, edge_count, edge_ids
@@ -94,7 +106,7 @@ def req_worker(
                 t1 = time.perf_counter()
                 stats.latencies_ms.append((t1 - t0) * 1000.0)
 
-                if resp.startswith("ROUTE "):
+                if resp.startswith(("ROUTE ", "ROUTE2 ")):
                     # Validate structure
                     parse_route(resp)
                     stats.ok += 1

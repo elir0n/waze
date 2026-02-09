@@ -271,7 +271,10 @@ int find_route_a_star_path(Graph* graph,
                            double* out_cost,
                            int* out_edges,
                            int max_edges,
-                           int* out_edge_count)
+                           int* out_edge_count,
+                           int* out_nodes,
+                           int max_nodes,
+                           int* out_node_count)
 {
     if (!graph || !out_cost || !out_edges || !out_edge_count) return 10;
 
@@ -388,6 +391,20 @@ int find_route_a_star_path(Graph* graph,
         int tmp = node_path[i];
         node_path[i] = node_path[path_len - 1 - i];
         node_path[path_len - 1 - i] = tmp;
+    }
+
+    /* Copy node path to caller if requested */
+    if (out_nodes && out_node_count) {
+        if (path_len > max_nodes) {
+            free(node_path);
+            free(g_score); free(f_score); free(parent);
+            freeMinHeap(minHeap);
+            return 17; /* node buffer too small */
+        }
+        for (int i = 0; i < path_len; i++) {
+            out_nodes[i] = node_path[i];
+        }
+        *out_node_count = path_len;
     }
 
     /* Convert node path to edge ids */

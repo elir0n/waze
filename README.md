@@ -120,7 +120,7 @@ REQ <source_node> <destination_node>
 ✅ Response on success:
 
 ```
-ROUTE <total_cost> <edge_count> <edge_id_1> <edge_id_2> ...
+ROUTE2 <total_cost> <node_count> n0 n1 ... <edge_count> e0 e1 ...
 ```
 
 ❌ If no route exists:

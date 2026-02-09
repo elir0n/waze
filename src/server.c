@@ -176,35 +176,58 @@ static char* build_route_response(Graph* g, int src, int dst) {
 
     int max_edges = (g->num_nodes > 0) ? g->num_nodes : 1;
     int* path_edges = (int*)malloc(sizeof(int) * max_edges);
-    if (!path_edges) return strdup("ERR NO_MEM\n");
+    int* path_nodes = (int*)malloc(sizeof(int) * g->num_nodes);
+    if (!path_edges || !path_nodes) {
+        free(path_edges);
+        free(path_nodes);
+        return strdup("ERR NO_MEM\n");
+    }
 
     double cost = 0.0;
     int edge_count = 0;
-    int rc = find_route_a_star_path(g, src, dst, &cost, path_edges, max_edges, &edge_count);
+    int node_count = 0;
+    int rc = find_route_a_star_path(g, src, dst,
+                                    &cost,
+                                    path_edges, max_edges, &edge_count,
+                                    path_nodes, g->num_nodes, &node_count);
 
     if (rc == 1) {
         free(path_edges);
+        free(path_nodes);
         return strdup("ERR NO_ROUTE\n");
     }
     if (rc != 0) {
         free(path_edges);
+        free(path_nodes);
         return strdup("ERR ROUTE_FAIL\n");
     }
 
     /* Safety: ensure edge_count fits what we allocated */
     if (edge_count < 0 || edge_count > max_edges) {
         free(path_edges);
+        free(path_nodes);
         return strdup("ERR ROUTE_FAIL\n");
     }
 
-    size_t buf_sz = 64 + (size_t)edge_count * 16;
+    if (node_count < 0 || node_count > g->num_nodes) {
+        free(path_edges);
+        free(path_nodes);
+        return strdup("ERR ROUTE_FAIL\n");
+    }
+
+    size_t buf_sz = 64 + (size_t)edge_count * 16 + (size_t)node_count * 16;
     char* resp = (char*)malloc(buf_sz);
     if (!resp) {
         free(path_edges);
+        free(path_nodes);
         return strdup("ERR NO_MEM\n");
     }
 
-    int n = snprintf(resp, buf_sz, "ROUTE %.3f %d", cost, edge_count);
+    int n = snprintf(resp, buf_sz, "ROUTE2 %.3f %d", cost, node_count);
+    for (int i = 0; i < node_count && n > 0 && (size_t)n < buf_sz; i++) {
+        n += snprintf(resp + n, buf_sz - (size_t)n, " %d", path_nodes[i]);
+    }
+    n += snprintf(resp + n, buf_sz - (size_t)n, " %d", edge_count);
     for (int i = 0; i < edge_count && n > 0 && (size_t)n < buf_sz; i++) {
         n += snprintf(resp + n, buf_sz - (size_t)n, " %d", path_edges[i]);
     }
@@ -212,11 +235,13 @@ static char* build_route_response(Graph* g, int src, int dst) {
         snprintf(resp + n, buf_sz - (size_t)n, "\n");
     } else {
         free(path_edges);
+        free(path_nodes);
         free(resp);
         return strdup("ERR ROUTE_FAIL\n");
     }
 
     free(path_edges);
+    free(path_nodes);
     return resp;
 }
 

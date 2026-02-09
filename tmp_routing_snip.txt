@@ -1,0 +1,120 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <float.h>
+#include <string.h>
+#include "graph.h"
+#include "min_heap.h"
+#include "routing.h"
+
+/*
+// heuristic is on Euclidean distance
+double get_heuristic(Node* a, Node* b) {
+    return sqrt(pow(a->x - b->x, 2) + pow(a->y - b->y, 2));
+}
+
+// finel print
+void print_path(int current_node, int* parent) {
+    if (current_node == -1) {
+        return;
+    }
+    print_path(parent[current_node], parent);
+    printf("%d -> ", current_node);
+}
+
+// A* Search
+void find_route_a_star(Graph* graph, int start_id, int target_id) {
+    int V = graph->num_nodes;
+    
+    double* g_score = (double*)malloc(V * sizeof(double));
+    double* f_score = (double*)malloc(V * sizeof(double));
+    int* parent = (int*)malloc(V * sizeof(int));
+
+    MinHeap* minHeap = createMinHeap(V);
+
+    // initialize
+    for (int i = 0; i < V; i++) {
+        g_score[i] = DBL_MAX;
+        f_score[i] = DBL_MAX;
+        parent[i] = -1;
+        
+        // initialize each node to infinity
+        minHeap->array[i] = newMinHeapNode(i, DBL_MAX);
+        minHeap->pos[i] = i;
+    }
+    minHeap->size = V; 
+
+    //  start node
+    g_score[start_id] = 0.0;
+    f_score[start_id] = get_heuristic(&graph->nodes[start_id], &graph->nodes[target_id]);
+    decreaseKey(minHeap, start_id, f_score[start_id]);
+
+    printf("Starting A* Search from node %d to %d...\n", start_id, target_id);
+
+    while (!isEmpty(minHeap)) {
+        // extractMin
+        MinHeapNode* minNode = extractMin(minHeap);
+        int u = minNode->node_id;
+
+        
+        if (g_score[u] == DBL_MAX) break;
+
+        // in the target
+        if (u == target_id) {
+            printf("\nDestination reached! Cost: %.2f\n", g_score[u]);
+            printf("Path: ");
+            print_path(target_id, parent);
+            printf("END\n");
+            
+            free(g_score); free(f_score); free(parent);
+            freeMinHeap(minHeap);free(minNode);
+            return;
+        }
+
+        // explore neighbors
+        EdgeNode* curr_edge = graph->nodes[u].out_edges;
+        while (curr_edge != NULL) {
+            int v = curr_edge->edge_data.to_node;
+            double weight = curr_edge->edge_data.current_travel_time;
+
+            // g score
+            double tentative_g = g_score[u] + weight;
+
+            if (tentative_g < g_score[v]) {
+                // found a better path
+                g_score[v] = tentative_g;
+                double h = get_heuristic(&graph->nodes[v], &graph->nodes[target_id]);
+                f_score[v] = g_score[v] + h;
+                parent[v] = u;
+
+                // update in min heap
+                if (isInMinHeap(minHeap, v)) {
+                    decreaseKey(minHeap, v, f_score[v]);
+                }
+            }
+            curr_edge = curr_edge->next;
+        }
+    }
+
+    printf("No path found.\n");
+    free(g_score); free(f_score); free(parent); 
+ 
+}
+    */
+
+
+
+/*
+ * Print path from start to current_node using parent[] array
+ */
+static void print_path(int current_node, const int* parent)
+{
+    if (current_node == -1) return;
+    print_path(parent[current_node], parent);
+    printf("%d ", current_node);
+}
+
+/*
+ * A* Search
+ * Finds route from start_id to target_id using:
+ *  - g_score: cost-so-far
