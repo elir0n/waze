@@ -99,7 +99,7 @@ A Python script is provided to generate synthetic graphs.
 Example (1000 nodes, 3000 edges):
 
 ```bash
-./generate_graph.py --nodes 1000 --edges 3000
+python3 generate_graph.py --nodes 1000 --edges 3000
 ```
 
 This generates `graph.meta`, `nodes.csv`, and `edges.csv` directly in the `data/` directory.
@@ -116,39 +116,34 @@ nc 127.0.0.1 8080
 
 ### 🧭 Routing Request
 
-```
-REQ <source_node> <destination_node>
+```json
+{"user_id":1,"car_id":1,"start_node":10,"destination_node":42,"timestamp":12.5}
 ```
 
 ✅ Response on success:
 
-```
-ROUTE2 <total_cost> <node_count> n0 n1 ... <edge_count> e0 e1 ...
+```json
+{"user_id":1,"car_id":1,"route_edges":[100,233,912],"eta":47.31}
 ```
 
 ❌ If no route exists:
 
-```
-ERR NO_ROUTE
+```json
+{"error":"NO_ROUTE","user_id":1,"car_id":1}
 ```
 
 ### 🚦 Traffic Update
 
-```
-UPD <edge_id> <speed>
-```
-
-Optional (position on edge, 0.0–1.0):
-
-```
-UPD <edge_id> <speed> <position>
+```json
+{"user_id":1,"car_id":1,"timestamp":13.0,"edge_id":233,"position_on_edge":0.45,"speed":16.2}
 ```
 
 Response:
 
+```json
+{"status":"ACK","user_id":1,"car_id":1}
 ```
-ACK
-```
+Note: in this implementation, `car_id` is set equal to `user_id`; both are kept in the protocol for future scalability (multiple cars/sessions per user).
 
 Traffic updates adjust the travel time using an **EMA**.
 
@@ -171,8 +166,9 @@ The prediction is a simple heuristic: the server returns the edge’s EMA travel
 ## 🧵 Concurrency Model
 
 - Each client connection runs in its **own thread**
-- Routing requests (REQ) acquire a **read lock**
-- Traffic updates (UPD) acquire a **write lock**
+- Routing requests are pushed into a **routing queue** and handled by a **routing worker pool**
+- Traffic reports are pushed into a **traffic queue** and handled by a **traffic worker pool**
+- Routing workers use a **read lock**; traffic workers use a **write lock**
 - Shared graph data is protected by a global `pthread_rwlock_t`
 
 This allows:
@@ -184,7 +180,7 @@ This allows:
 
 ## 🚗 Simulation (CLI)
 
-The simulation spawns multiple cars, each with its own TCP connection, and runs a discrete-time loop. Cars request routes, move along edges, and periodically report traffic updates.
+The simulation spawns multiple cars, each with its own TCP connection, and runs a discrete-time loop. Cars request routes, move along edges, periodically report traffic updates, and can reroute mid-trip.
 
 Run the server (in one terminal):
 
@@ -196,7 +192,7 @@ make
 Run the simulation (in another terminal):
 
 ```bash
-python3 cli_sim.py --mode sim --cars 20 --steps 200
+python3 cli_sim.py --mode sim --cars 20 --steps 200 --sim-workers 8 --reroute-every-steps 5
 ```
 
 Interactive routing (manual REQ):

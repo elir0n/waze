@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -65,6 +66,49 @@ static int send_all(int client_fd, const char* s) {
     return 0;
 }
 
+static int json_extract_int(const char* json, const char* key, int* out) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(json, pat);
+    if (!p) return 0;
+    p = strchr(p, ':');
+    if (!p) return 0;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    char* endp = NULL;
+    long v = strtol(p, &endp, 10);
+    if (endp == p) return 0;
+    *out = (int)v;
+    return 1;
+}
+
+static int json_extract_double(const char* json, const char* key, double* out) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(json, pat);
+    if (!p) return 0;
+    p = strchr(p, ':');
+    if (!p) return 0;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    char* endp = NULL;
+    double v = strtod(p, &endp);
+    if (endp == p) return 0;
+    *out = v;
+    return 1;
+}
+
+static char* build_error_response(const char* code, int user_id, int car_id) {
+    char* resp = (char*)malloc(160);
+    if (!resp) return strdup("{\"error\":\"NO_MEM\"}\n");
+    if (user_id >= 0 && car_id >= 0) {
+        snprintf(resp, 160, "{\"error\":\"%s\",\"user_id\":%d,\"car_id\":%d}\n", code, user_id, car_id);
+    } else {
+        snprintf(resp, 160, "{\"error\":\"%s\"}\n", code);
+    }
+    return resp;
+}
+
 /* ---------------- task + queues ---------------- */
 
 typedef enum {
@@ -82,11 +126,15 @@ typedef struct Task {
     int client_fd;
 
     /* REQ payload */
+    int user_id;
+    int car_id;
+    double timestamp;
     int src;
     int dst;
 
     /* UPD payload */
     int edge_id;
+    double position;
     double speed;
 
     /* PRED payload */
@@ -173,9 +221,9 @@ static void task_destroy(Task* t) {
 
 /* ---------------- protocol execution (workers) ---------------- */
 
-static char* build_route_response(Graph* g, int src, int dst) {
+static char* build_route_response(Graph* g, int user_id, int car_id, int src, int dst) {
     if (src < 0 || src >= g->num_nodes || dst < 0 || dst >= g->num_nodes) {
-        return strdup("ERR BAD_NODES\n");
+        return build_error_response("BAD_NODES", user_id, car_id);
     }
 
     int max_edges = (g->num_nodes > 0) ? g->num_nodes : 1;
@@ -184,7 +232,7 @@ static char* build_route_response(Graph* g, int src, int dst) {
     if (!path_edges || !path_nodes) {
         free(path_edges);
         free(path_nodes);
-        return strdup("ERR NO_MEM\n");
+        return build_error_response("NO_MEM", user_id, car_id);
     }
 
     double cost = 0.0;
@@ -198,50 +246,46 @@ static char* build_route_response(Graph* g, int src, int dst) {
     if (rc == 1) {
         free(path_edges);
         free(path_nodes);
-        return strdup("ERR NO_ROUTE\n");
+        return build_error_response("NO_ROUTE", user_id, car_id);
     }
     if (rc != 0) {
         free(path_edges);
         free(path_nodes);
-        return strdup("ERR ROUTE_FAIL\n");
+        return build_error_response("ROUTE_FAIL", user_id, car_id);
     }
 
     /* Safety: ensure edge_count fits what we allocated */
     if (edge_count < 0 || edge_count > max_edges) {
         free(path_edges);
         free(path_nodes);
-        return strdup("ERR ROUTE_FAIL\n");
+        return build_error_response("ROUTE_FAIL", user_id, car_id);
     }
 
     if (node_count < 0 || node_count > g->num_nodes) {
         free(path_edges);
         free(path_nodes);
-        return strdup("ERR ROUTE_FAIL\n");
+        return build_error_response("ROUTE_FAIL", user_id, car_id);
     }
 
-    size_t buf_sz = 64 + (size_t)edge_count * 16 + (size_t)node_count * 16;
+    size_t buf_sz = 128 + (size_t)edge_count * 16;
     char* resp = (char*)malloc(buf_sz);
     if (!resp) {
         free(path_edges);
         free(path_nodes);
-        return strdup("ERR NO_MEM\n");
+        return build_error_response("NO_MEM", user_id, car_id);
     }
 
-    int n = snprintf(resp, buf_sz, "ROUTE2 %.3f %d", cost, node_count);
-    for (int i = 0; i < node_count && n > 0 && (size_t)n < buf_sz; i++) {
-        n += snprintf(resp + n, buf_sz - (size_t)n, " %d", path_nodes[i]);
-    }
-    n += snprintf(resp + n, buf_sz - (size_t)n, " %d", edge_count);
+    int n = snprintf(resp, buf_sz, "{\"user_id\":%d,\"car_id\":%d,\"route_edges\":[", user_id, car_id);
     for (int i = 0; i < edge_count && n > 0 && (size_t)n < buf_sz; i++) {
-        n += snprintf(resp + n, buf_sz - (size_t)n, " %d", path_edges[i]);
+        n += snprintf(resp + n, buf_sz - (size_t)n, "%s%d", (i == 0 ? "" : ","), path_edges[i]);
     }
     if (n > 0 && (size_t)n < buf_sz) {
-        snprintf(resp + n, buf_sz - (size_t)n, "\n");
+        snprintf(resp + n, buf_sz - (size_t)n, "],\"eta\":%.3f}\n", cost);
     } else {
         free(path_edges);
         free(path_nodes);
         free(resp);
-        return strdup("ERR ROUTE_FAIL\n");
+        return build_error_response("ROUTE_FAIL", user_id, car_id);
     }
 
     free(path_edges);
@@ -249,12 +293,12 @@ static char* build_route_response(Graph* g, int src, int dst) {
     return resp;
 }
 
-static char* apply_update(Graph* g, int edge_id, double speed) {
+static char* apply_update(Graph* g, int user_id, int car_id, int edge_id, double speed) {
     if (edge_id < 0 || edge_id >= g->num_edges) {
-        return strdup("ERR BAD_EDGE\n");
+        return build_error_response("BAD_EDGE", user_id, car_id);
     }
     if (speed <= 0.0) {
-        return strdup("ERR BAD_SPEED\n");
+        return build_error_response("BAD_SPEED", user_id, car_id);
     }
 
     const double min_speed = 1e-6;
@@ -268,7 +312,10 @@ static char* apply_update(Graph* g, int edge_id, double speed) {
     e->current_travel_time = e->ema_travel_time;
     e->observation_count++;
 
-    return strdup("ACK\n");
+    char* ack = (char*)malloc(96);
+    if (!ack) return build_error_response("NO_MEM", user_id, car_id);
+    snprintf(ack, 96, "{\"status\":\"ACK\",\"user_id\":%d,\"car_id\":%d}\n", user_id, car_id);
+    return ack;
 }
 
 static char* build_pred_response(Graph* g, int edge_id) {
@@ -308,11 +355,11 @@ static void* routing_worker_main(void* arg) {
         pthread_rwlock_rdlock(&st->graph_lock);
         char* resp = NULL;
         if (t->type == TASK_REQ) {
-            resp = build_route_response(st->g, t->src, t->dst);
+            resp = build_route_response(st->g, t->user_id, t->car_id, t->src, t->dst);
         } else if (t->type == TASK_PRED) {
             resp = build_pred_response(st->g, t->pred_edge_id);
         } else {
-            resp = strdup("ERR INTERNAL\n");
+            resp = build_error_response("INTERNAL", t->user_id, t->car_id);
         }
         pthread_rwlock_unlock(&st->graph_lock);
 
@@ -329,7 +376,7 @@ static void* traffic_worker_main(void* arg) {
         Task* t = queue_pop(&st->traffic_q);
         /* Execute UPD under write lock */
         pthread_rwlock_wrlock(&st->graph_lock);
-        char* resp = apply_update(st->g, t->edge_id, t->speed);
+        char* resp = apply_update(st->g, t->user_id, t->car_id, t->edge_id, t->speed);
         pthread_rwlock_unlock(&st->graph_lock);
 
         task_complete(t, resp);
@@ -363,30 +410,68 @@ static void* client_thread_main(void* arg) {
 
         trim_crlf(line);
         if (line[0] == '\0') {
-            send_all(client_fd, "ERR EMPTY\n");
+            send_all(client_fd, "{\"error\":\"EMPTY\"}\n");
             continue;
         }
 
         Task* t = task_create(st->g, &st->graph_lock, client_fd);
         if (!t) {
-            send_all(client_fd, "ERR NO_MEM\n");
+            send_all(client_fd, "{\"error\":\"NO_MEM\"}\n");
             continue;
         }
 
         int src, dst;
         int edge_id;
+        int user_id;
+        int car_id;
         double speed;
         double position;
+        double timestamp;
 
-        if (sscanf(line, "REQ %d %d", &src, &dst) == 2) {
+        if (json_extract_int(line, "start_node", &src) &&
+            json_extract_int(line, "destination_node", &dst) &&
+            json_extract_int(line, "user_id", &user_id) &&
+            json_extract_int(line, "car_id", &car_id) &&
+            json_extract_double(line, "timestamp", &timestamp)) {
             t->type = TASK_REQ;
+            t->user_id = user_id;
+            t->car_id = car_id;
+            t->timestamp = timestamp;
             t->src = src;
             t->dst = dst;
 
             queue_push(&st->routing_q, t);
 
-        } else if (sscanf(line, "UPD %d %lf %lf", &edge_id, &speed, &position) >= 2) {
+        } else if (json_extract_int(line, "edge_id", &edge_id) &&
+                   json_extract_double(line, "speed", &speed) &&
+                   json_extract_double(line, "position_on_edge", &position) &&
+                   json_extract_int(line, "user_id", &user_id) &&
+                   json_extract_int(line, "car_id", &car_id) &&
+                   json_extract_double(line, "timestamp", &timestamp)) {
             t->type = TASK_UPD;
+            t->user_id = user_id;
+            t->car_id = car_id;
+            t->timestamp = timestamp;
+            t->edge_id = edge_id;
+            t->position = position;
+            t->speed = speed;
+
+            queue_push(&st->traffic_q, t);
+
+        } else if (sscanf(line, "REQ %d %d", &src, &dst) == 2) {
+            /* Backward compatibility */
+            t->type = TASK_REQ;
+            t->user_id = -1;
+            t->car_id = -1;
+            t->src = src;
+            t->dst = dst;
+            queue_push(&st->routing_q, t);
+
+        } else if (sscanf(line, "UPD %d %lf %lf", &edge_id, &speed, &position) >= 2) {
+            /* Backward compatibility */
+            t->type = TASK_UPD;
+            t->user_id = -1;
+            t->car_id = -1;
             t->edge_id = edge_id;
             t->speed = speed;
 
@@ -400,7 +485,7 @@ static void* client_thread_main(void* arg) {
 
         } else {
             task_destroy(t);
-            send_all(client_fd, "ERR UNKNOWN_CMD\n");
+            send_all(client_fd, "{\"error\":\"UNKNOWN_CMD\"}\n");
             continue;
         }
 
@@ -415,7 +500,7 @@ static void* client_thread_main(void* arg) {
         if (resp) {
             send_all(client_fd, resp);
         } else {
-            send_all(client_fd, "ERR INTERNAL\n");
+            send_all(client_fd, "{\"error\":\"INTERNAL\"}\n");
         }
 
         task_destroy(t);

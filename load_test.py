@@ -1,11 +1,12 @@
-#!/usr/bin/env python3
 import argparse
+import json
 import random
 import socket
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import List, Optional
+
 
 # --------- helpers ---------
 
@@ -14,13 +15,14 @@ def connect(host: str, port: int, timeout: float) -> socket.socket:
     s.settimeout(timeout)
     return s
 
+
 def send_line(sock: socket.socket, line: str) -> None:
     if not line.endswith("\n"):
         line += "\n"
     sock.sendall(line.encode("utf-8"))
 
+
 def recv_line(sock: socket.socket) -> str:
-    # Read until '\n'
     chunks = []
     while True:
         b = sock.recv(1)
@@ -31,29 +33,14 @@ def recv_line(sock: socket.socket) -> str:
             break
     return b"".join(chunks).decode("utf-8", errors="replace")
 
-def parse_route(resp: str) -> Tuple[float, int, List[int]]:
-    parts = resp.strip().split()
-    if len(parts) < 3:
-        raise ValueError(f"Not a ROUTE response: {resp!r}")
 
-    if parts[0] == "ROUTE":
-        cost = float(parts[1])
-        edge_count = int(parts[2])
-        edge_ids = [int(x) for x in parts[3:]]
-    elif parts[0] == "ROUTE2":
-        cost = float(parts[1])
-        node_count = int(parts[2])
-        idx_edges = 3 + node_count
-        if idx_edges >= len(parts):
-            raise ValueError(f"ROUTE2 missing edge_count: {resp!r}")
-        edge_count = int(parts[idx_edges])
-        edge_ids = [int(x) for x in parts[idx_edges + 1 :]]
-    else:
-        raise ValueError(f"Not a ROUTE response: {resp!r}")
+def send_json(sock: socket.socket, payload: dict) -> None:
+    send_line(sock, json.dumps(payload, separators=(",", ":")))
 
-    if len(edge_ids) != edge_count:
-        raise ValueError(f"edge_count mismatch: declared={edge_count} got={len(edge_ids)} resp={resp!r}")
-    return cost, edge_count, edge_ids
+
+def recv_json(sock: socket.socket) -> dict:
+    return json.loads(recv_line(sock).strip())
+
 
 # --------- stats ---------
 
@@ -69,12 +56,14 @@ class Stats:
         if self.latencies_ms is None:
             self.latencies_ms = []
 
+
 def percentile(xs: List[float], p: float) -> float:
     if not xs:
         return float("nan")
     xs_sorted = sorted(xs)
     k = int(round((p / 100.0) * (len(xs_sorted) - 1)))
     return xs_sorted[max(0, min(k, len(xs_sorted) - 1))]
+
 
 # --------- worker logic ---------
 
@@ -86,7 +75,7 @@ def req_worker(
     rounds: int,
     think_ms: int,
     stats: Stats,
-    seed: int
+    seed: int,
 ) -> None:
     rnd = random.Random(seed)
     try:
@@ -95,24 +84,37 @@ def req_worker(
         stats.other_fail += 1
         return
 
+    user_id = seed
+    car_id = seed
+
     with sock:
-        for _ in range(rounds):
+        for i in range(rounds):
             src = rnd.randrange(0, max(1, num_nodes))
             dst = rnd.randrange(0, max(1, num_nodes))
+            req = {
+                "user_id": user_id,
+                "car_id": car_id,
+                "start_node": src,
+                "destination_node": dst,
+                "timestamp": float(i),
+            }
+
             t0 = time.perf_counter()
             try:
-                send_line(sock, f"REQ {src} {dst}")
-                resp = recv_line(sock)
+                send_json(sock, req)
+                resp = recv_json(sock)
                 t1 = time.perf_counter()
                 stats.latencies_ms.append((t1 - t0) * 1000.0)
 
-                if resp.startswith(("ROUTE ", "ROUTE2 ")):
-                    # Validate structure
-                    parse_route(resp)
-                    stats.ok += 1
-                elif resp.startswith("ERR "):
-                    # ERR NO_ROUTE is valid depending on graph connectivity
+                if "error" in resp:
                     stats.err += 1
+                elif (
+                    resp.get("user_id") == user_id
+                    and resp.get("car_id") == car_id
+                    and isinstance(resp.get("route_edges"), list)
+                    and "eta" in resp
+                ):
+                    stats.ok += 1
                 else:
                     stats.other_fail += 1
             except socket.timeout:
@@ -122,6 +124,7 @@ def req_worker(
 
             if think_ms > 0:
                 time.sleep(think_ms / 1000.0)
+
 
 def upd_worker(
     host: str,
@@ -131,7 +134,7 @@ def upd_worker(
     rounds: int,
     think_ms: int,
     stats: Stats,
-    seed: int
+    seed: int,
 ) -> None:
     rnd = random.Random(seed)
     try:
@@ -140,25 +143,37 @@ def upd_worker(
         stats.other_fail += 1
         return
 
+    user_id = seed
+    car_id = seed
+
     with sock:
-        for _ in range(rounds):
+        for i in range(rounds):
             if num_edges <= 0:
                 stats.err += 1
                 return
             edge_id = rnd.randrange(0, num_edges)
-            # Speed in some reasonable range; you can change
             speed = rnd.uniform(1.0, 30.0)
+            pos = rnd.uniform(0.0, 1.0)
+
+            report = {
+                "user_id": user_id,
+                "car_id": car_id,
+                "timestamp": float(i),
+                "edge_id": edge_id,
+                "position_on_edge": pos,
+                "speed": speed,
+            }
 
             t0 = time.perf_counter()
             try:
-                send_line(sock, f"UPD {edge_id} {speed:.3f}")
-                resp = recv_line(sock)
+                send_json(sock, report)
+                resp = recv_json(sock)
                 t1 = time.perf_counter()
                 stats.latencies_ms.append((t1 - t0) * 1000.0)
 
-                if resp.strip() == "ACK":
+                if resp.get("status") == "ACK":
                     stats.ok += 1
-                elif resp.startswith("ERR "):
+                elif "error" in resp:
                     stats.err += 1
                 else:
                     stats.other_fail += 1
@@ -170,10 +185,11 @@ def upd_worker(
             if think_ms > 0:
                 time.sleep(think_ms / 1000.0)
 
+
 # --------- main ---------
 
-def main():
-    ap = argparse.ArgumentParser(description="Load test for your Waze server (REQ/UPD, parallel).")
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Load test for your Waze server (JSON route/traffic protocol, parallel).")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--timeout", type=float, default=3.0)
@@ -238,12 +254,12 @@ def main():
     report("REQ", req_stats)
     report("UPD", upd_stats)
 
-    # Simple pass/fail heuristics
     if req_stats.other_fail or upd_stats.other_fail:
         raise SystemExit("FAIL: Some operations had unexpected failures (other_fail > 0).")
     if req_stats.timeouts or upd_stats.timeouts:
         raise SystemExit("WARN: Some operations timed out; server might be overloaded or deadlocked.")
     print("\nPASS: Completed parallel REQ/UPD load with no unexpected failures.")
+
 
 if __name__ == "__main__":
     main()
