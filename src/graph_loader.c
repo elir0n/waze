@@ -25,7 +25,6 @@ static int read_meta_counts(const char* meta_path, int* out_nodes, int* out_edge
     while (fscanf(f, "%63s %d", key, &val) == 2) {
         if (strcmp(key, "num_nodes") == 0) num_nodes = val;
         else if (strcmp(key, "num_edges") == 0) num_edges = val;
-        /* ignore unknown keys */
     }
 
     fclose(f);

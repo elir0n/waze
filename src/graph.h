@@ -14,8 +14,7 @@ typedef struct {
     double base_speed_limit;
 
     double current_travel_time;
-
-    // Historical statistics (for traffic updates / prediction)
+    
     double ema_travel_time;
     int observation_count;
 } Edge;

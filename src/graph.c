@@ -134,7 +134,7 @@ double heuristic(Graph* g, int from_node, int to_node)
     double dy = g->nodes[from_node].y - g->nodes[to_node].y;
     double straight_dist = sqrt(dx * dx + dy * dy);
 
-    /* Use a time-based admissible heuristic: straight-line distance / max speed */
+    /* A time-based heuristic: straight-line distance / max speed */
     double max_speed = 0.0;
     for (int i = 0; i < g->num_edges; i++) {
         if (g->edges && g->edges[i].base_speed_limit > max_speed) {
