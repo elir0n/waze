@@ -12,18 +12,21 @@ from typing import Dict, List, Optional, Tuple
 # ---------------- network helpers ----------------
 
 def connect(host: str, port: int, timeout: float) -> socket.socket:
+    """Open a TCP connection to the server and give back a socket with the timeout already set."""
     s = socket.create_connection((host, port), timeout=timeout)
     s.settimeout(timeout)
     return s
 
 
 def send_line(sock: socket.socket, line: str) -> None:
+    """Send one text line to the server, making sure it ends with a newline and is encoded as UTF-8."""
     if not line.endswith("\n"):
         line += "\n"
     sock.sendall(line.encode("utf-8"))
 
 
 def recv_line(sock: socket.socket) -> str:
+    """Read from the socket byte by byte until I hit a newline, then return that line as text."""
     chunks = []
     while True:
         b = sock.recv(1)
@@ -36,6 +39,7 @@ def recv_line(sock: socket.socket) -> str:
 
 
 def send_json(sock: socket.socket, payload: dict) -> None:
+    """Dump a small JSON dict into a single compact line and send it over the socket."""
     send_line(sock, json.dumps(payload, separators=(",", ":")))
 
 
@@ -47,6 +51,7 @@ def recv_json(sock: socket.socket) -> dict:
 # ---------------- graph loading ----------------
 
 def load_graph_meta(path: str) -> Tuple[int, int]:
+    """Read the simple graph.meta file and pull out how many nodes and edges the graph has."""
     num_nodes = None
     num_edges = None
     with open(path, "r", encoding="utf-8") as f:
@@ -76,6 +81,7 @@ class EdgeInfo:
 
 
 def load_edges(path: str) -> Dict[int, EdgeInfo]:
+    """Load all edges from edges.csv into a dict so I can quickly look up edge details by edge_id."""
     edges: Dict[int, EdgeInfo] = {}
     with open(path, "r", encoding="utf-8") as f:
         r = csv.DictReader(f)
@@ -101,6 +107,7 @@ def request_route(
     dst: int,
     timestamp: float,
 ) -> Tuple[bool, Optional[Tuple[float, List[int]]]]:
+    """Ask the server for a route and ETA; return success flag plus (eta, list of edge_ids) if all looks valid."""
     req = {
         "user_id": user_id,
         "car_id": car_id,
@@ -139,6 +146,7 @@ def send_traffic_report(
     position_on_edge: float,
     speed: float,
 ) -> bool:
+    """Send the server a single traffic report for one car on one edge and check that I got an ACK back."""
     report = {
         "user_id": user_id,
         "car_id": car_id,
@@ -153,6 +161,7 @@ def send_traffic_report(
 
 
 def request_pred(sock: socket.socket, edge_id: int) -> Tuple[bool, Optional[float]]:
+    """Ask the server for the predicted travel time of a given edge."""
     send_line(sock, f"PRED {edge_id}")
     resp = recv_line(sock).strip()
     parts = resp.split()
@@ -192,6 +201,7 @@ class Car:
         self.dst = dst
 
     def current_edge(self) -> Optional[int]:
+        """Return the current edge_id the car is driving on, or None if it has no more edges."""
         if self.current_edge_index >= len(self.route_edges):
             return None
         return self.route_edges[self.current_edge_index]
@@ -199,11 +209,13 @@ class Car:
 
 @dataclass
 class JamState:
+    """Keep track of which edges are currently jammed, for how long, and how many cars are on each edge."""
     jam_factor: Dict[int, float] = field(default_factory=dict)
     jam_remaining: Dict[int, int] = field(default_factory=dict)
     edge_occupancy: Dict[int, int] = field(default_factory=dict)
 
     def maybe_start_jam(self, edge_id: int, rnd: random.Random, args: argparse.Namespace) -> None:
+        """Maybe start a jam on this edge based on how crowded it is and a random chance."""
         if edge_id in self.jam_remaining:
             return
         occ = self.edge_occupancy.get(edge_id, 0)
@@ -215,9 +227,11 @@ class JamState:
         self.jam_remaining[edge_id] = rnd.randint(args.jam_min_steps, args.jam_max_steps)
 
     def get_factor(self, edge_id: int) -> float:
+        """Tell me how much slower this edge currently is (1.0 means no jam)."""
         return self.jam_factor.get(edge_id, 1.0)
 
     def tick(self) -> None:
+        """Advance the jam timers by one simulation step and clear jams that have finished."""
         to_clear = []
         for edge_id in list(self.jam_remaining.keys()):
             self.jam_remaining[edge_id] -= 1
@@ -228,6 +242,7 @@ class JamState:
             self.jam_factor.pop(edge_id, None)
 
     def update_occupancy(self, cars: List[Car]) -> None:
+        """Re-count how many cars are currently driving on each edge for this simulation step."""
         counts: Dict[int, int] = {}
         for c in cars:
             if c.state != "DRIVING":
@@ -240,6 +255,7 @@ class JamState:
 
 
 def pick_dst(rnd: random.Random, num_nodes: int, src: int) -> int:
+    """Pick a random destination node that is different from src (or src itself if graph is trivial)."""
     if num_nodes <= 1:
         return src
     dst = src
@@ -255,6 +271,7 @@ def maybe_reroute_midway(
     edges: Dict[int, EdgeInfo],
     args: argparse.Namespace,
 ) -> None:
+    """From time to time, ask the server for a fresh route from the car's next node to its final dst."""
     if args.reroute_every_steps <= 0 or (step % args.reroute_every_steps) != 0:
         return
     if car.state != "DRIVING" or car.dst is None:
@@ -292,6 +309,7 @@ def process_car_step(
     jam_state: JamState,
     args: argparse.Namespace,
 ) -> None:
+    """Advance one car by a single simulation step: request routes, move along edges, send reports and update stats."""
     rnd = car.rng
 
     if car.cooldown_steps > 0:
@@ -374,6 +392,7 @@ def process_car_step(
 
 
 def simulate_loop(args: argparse.Namespace) -> None:
+    """Main simulation: spin up all the cars, step them in parallel, manage jams and print periodic stats."""
     num_nodes, _ = load_graph_meta(f"{args.graph_dir}/graph.meta")
     edges = load_edges(f"{args.graph_dir}/edges.csv")
 
@@ -438,6 +457,7 @@ def simulate_loop(args: argparse.Namespace) -> None:
 
 
 def interactive_mode(args: argparse.Namespace) -> None:
+    """Simple REPL mode where I can type src/dst or PRED commands and see what the server answers."""
     num_nodes, _ = load_graph_meta(f"{args.graph_dir}/graph.meta")
     sock = connect(args.host, args.port, args.timeout)
     with sock:

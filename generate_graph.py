@@ -33,16 +33,16 @@ def main():
     # ---------------- edges ----------------
     edges = []
 
-    # Step 1: spanning tree (guaranteed connectivity)
+    # spanning tree (guaranteed connectivity)
     for i in range(1, N):
         j = random.randrange(0, i)
         dx = nodes[i][1] - nodes[j][1]
         dy = nodes[i][2] - nodes[j][2]
-        length = math.hypot(dx, dy)
+        length = math.hypot(dx, dy) # geometric distance
         speed = random.choice([30, 40, 50, 60])
         edges.append((len(edges), j, i, length, speed))
 
-    # Step 2: random extra edges
+    # random extra edges
     while len(edges) < M:
         u = random.randrange(0, N)
         v = random.randrange(0, N)
