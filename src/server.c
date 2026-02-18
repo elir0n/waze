@@ -600,7 +600,6 @@ int server_run(Graph* g, int port) {
         pthread_detach(tid);
     }
 
-    /* Unreachable in this assignment version */
     close(listen_fd);
     pthread_rwlock_destroy(&st.graph_lock);
     return 0;
