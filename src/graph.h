@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #define MAX_NODES 100000
+#define MAX_ROAD_TYPE_LEN 32
 
 typedef struct {
     int edge_id;
@@ -12,6 +13,9 @@ typedef struct {
 
     double base_length;
     double base_speed_limit;
+    char road_type[MAX_ROAD_TYPE_LEN];
+    int lanes;
+    int is_oneway;
 
     double current_travel_time;
     
@@ -26,8 +30,8 @@ typedef struct EdgeNode {
 
 typedef struct {
     int node_id;
-    double x;
-    double y;
+    double lat;
+    double lon;
     EdgeNode* out_edges;
 } Node;
 
@@ -42,11 +46,12 @@ typedef struct {
 /* Graph API */
 void graph_init(Graph* g, int num_nodes, int num_edges);
 void graph_add_edge(Graph* g, int edge_id, int from, int to,
-                    double length, double speed_limit);
+                    double length, double speed_limit,
+                    const char* road_type, int lanes, int is_oneway);
 
 double get_edge_weight(Graph* g, int edge_id);
 double heuristic(Graph* g, int from_node, int to_node);
-void graph_set_node_coordinates(Graph* g, int node_id, double x, double y);
+void graph_set_node_coordinates(Graph* g, int node_id, double lat, double lon);
 void graph_free(Graph* g);
 
 #endif

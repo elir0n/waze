@@ -79,13 +79,13 @@ num_edges <M>
 ### nodes.csv
 
 ```
-node_id,x,y
+node_id,lat,lon
 ```
 
 ### edges.csv
 
 ```
-edge_id,from_node,to_node,base_length,base_speed_limit
+edge_id,from_node,to_node,base_length,base_speed_limit,road_type,lanes,is_oneway
 ```
 
 The graph is **directed**. Node coordinates are used for the A* heuristic.

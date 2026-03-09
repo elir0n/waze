@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include "graph.h"
 
 void graph_init(Graph* g, int num_nodes, int num_edges)
@@ -32,22 +33,22 @@ void graph_init(Graph* g, int num_nodes, int num_edges)
     /* Initialize nodes */
     for (int i = 0; i < num_nodes; i++) {
         g->nodes[i].node_id = i;
-        g->nodes[i].x = 0.0;
-        g->nodes[i].y = 0.0;
+        g->nodes[i].lat = 0.0;
+        g->nodes[i].lon = 0.0;
         g->nodes[i].out_edges = NULL;
     }
 }
 
 
-void graph_set_node_coordinates(Graph* g, int node_id, double x, double y)
+void graph_set_node_coordinates(Graph* g, int node_id, double lat, double lon)
 {
     if (!g || node_id < 0 || node_id >= g->num_nodes) {
         fprintf(stderr, "graph_set_node_coordinates: invalid node_id\n");
         exit(1);
     }
 
-    g->nodes[node_id].x = x;
-    g->nodes[node_id].y = y;
+    g->nodes[node_id].lat = lat;
+    g->nodes[node_id].lon = lon;
 }
 
 
@@ -56,7 +57,10 @@ void graph_add_edge(Graph* g,
                     int from,
                     int to,
                     double length,
-                    double speed_limit)
+                    double speed_limit,
+                    const char* road_type,
+                    int lanes,
+                    int is_oneway)
 {
     if (!g) {
         fprintf(stderr, "graph_add_edge: graph is NULL\n");
@@ -80,6 +84,16 @@ void graph_add_edge(Graph* g,
         exit(1);
     }
 
+    if (lanes < 0) {
+        fprintf(stderr, "graph_add_edge: lanes must be non-negative\n");
+        exit(1);
+    }
+
+    if (is_oneway != 0 && is_oneway != 1) {
+        fprintf(stderr, "graph_add_edge: is_oneway must be 0 or 1\n");
+        exit(1);
+    }
+
     /* Initialize global edge */
     Edge* e = &g->edges[edge_id];
 
@@ -89,6 +103,14 @@ void graph_add_edge(Graph* g,
 
     e->base_length = length;
     e->base_speed_limit = speed_limit;
+    if (road_type) {
+        strncpy(e->road_type, road_type, MAX_ROAD_TYPE_LEN - 1);
+        e->road_type[MAX_ROAD_TYPE_LEN - 1] = '\0';
+    } else {
+        e->road_type[0] = '\0';
+    }
+    e->lanes = lanes;
+    e->is_oneway = is_oneway;
 
     /* Initial travel time */
     e->current_travel_time = length / speed_limit;
@@ -130,9 +152,16 @@ double heuristic(Graph* g, int from_node, int to_node)
         exit(1);
     }
 
-    double dx = g->nodes[from_node].x - g->nodes[to_node].x;
-    double dy = g->nodes[from_node].y - g->nodes[to_node].y;
-    double straight_dist = sqrt(dx * dx + dy * dy);
+    /* Equirectangular approximation for lat/lon coordinates. */
+    const double deg_to_rad = 3.14159265358979323846 / 180.0;
+    const double earth_radius_m = 6371000.0;
+    double lat1 = g->nodes[from_node].lat * deg_to_rad;
+    double lon1 = g->nodes[from_node].lon * deg_to_rad;
+    double lat2 = g->nodes[to_node].lat * deg_to_rad;
+    double lon2 = g->nodes[to_node].lon * deg_to_rad;
+    double x = (lon2 - lon1) * cos((lat1 + lat2) * 0.5);
+    double y = (lat2 - lat1);
+    double straight_dist = sqrt(x * x + y * y) * earth_radius_m;
 
     /* A time-based heuristic: straight-line distance / max speed */
     double max_speed = 0.0;

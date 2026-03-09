@@ -6,8 +6,8 @@
 /**
  * Loads the graph from:
  *   meta_path:  contains "num_nodes N" and "num_edges M"
- *   nodes_path: CSV: node_id,x,y
- *   edges_path: CSV: edge_id,from_node,to_node,base_length,base_speed_limit
+ *   nodes_path: CSV: node_id,lat,lon
+ *   edges_path: CSV: edge_id,from_node,to_node,base_length,base_speed_limit,road_type,lanes,is_oneway
  *
  * Returns 0 on success, non-zero on error.
  */
