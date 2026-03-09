@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<style>
+html, body, #map { height:100%; margin:0; }
+
+#metrics {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    z-index: 1000;
+    background: rgba(20,20,20,0.82);
+    color: #fff;
+    font: 14px/1.6 monospace;
+    padding: 10px 16px;
+    border-radius: 8px;
+    min-width: 180px;
+    pointer-events: none;
+}
+#metrics h3 {
+    margin: 0 0 6px;
+    font-size: 13px;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+    color: #aaa;
+}
+.metric-row { display: flex; justify-content: space-between; gap: 16px; }
+.metric-val { font-weight: bold; }
+.m-driving { color: #4fc3f7; }
+.m-arrived { color: #81c784; }
+.m-waiting { color: #ffb74d; }
+.m-total   { color: #e0e0e0; }
+
+#legend {
+    position: fixed;
+    bottom: 28px;
+    right: 12px;
+    z-index: 1000;
+    background: rgba(20,20,20,0.82);
+    color: #fff;
+    font: 12px/1.6 monospace;
+    padding: 8px 14px;
+    border-radius: 8px;
+    pointer-events: none;
+}
+#legend h3 {
+    margin: 0 0 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+    color: #aaa;
+}
+.legend-row { display: flex; align-items: center; gap: 8px; margin: 2px 0; }
+.legend-swatch {
+    width: 28px;
+    height: 5px;
+    border-radius: 2px;
+    display: inline-block;
+}
+</style>
+</head>
+
+<body>
+
+<div id="map"></div>
+
+<div id="metrics">
+    <h3>Live Traffic</h3>
+    <div class="metric-row"><span>🚗 Driving</span> <span class="metric-val m-driving" id="m-driving">—</span></div>
+    <div class="metric-row"><span>✅ Arrived</span> <span class="metric-val m-arrived" id="m-arrived">—</span></div>
+    <div class="metric-row"><span>⏳ Waiting</span> <span class="metric-val m-waiting" id="m-waiting">—</span></div>
+    <div class="metric-row" style="border-top:1px solid #444;margin-top:4px;padding-top:4px">
+        <span>Total</span> <span class="metric-val m-total" id="m-total">—</span>
+    </div>
+</div>
+
+<div id="legend">
+    <h3>Road congestion</h3>
+    <div class="legend-row"><span class="legend-swatch" style="background:#ff8c00"></span> Light</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:#ff4500"></span> Moderate</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:#cc0000"></span> Heavy</div>
+</div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+<script>
+
+const map = L.map('map').setView([32.0853,34.7818],13);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+    maxZoom:19
+}).addTo(map);
+
+/* ── car markers ── */
+const cars = {};
+
+function makeCarIcon(state) {
+    const styles = {
+        driving: 'font-size:20px;line-height:1;filter:drop-shadow(0 0 3px #1e88e5)',
+        arrived: 'font-size:18px;line-height:1;filter:drop-shadow(0 0 3px #43a047)',
+        idle:    'font-size:18px;line-height:1;filter:drop-shadow(0 0 3px #fb8c00);opacity:0.8'
+    };
+    const emojis = { driving: '🚗', arrived: '🏁', idle: '⏳' };
+    const style  = styles[state] || styles.driving;
+    const emoji  = emojis[state] || '🚗';
+    return L.divIcon({
+        className: '',
+        html: `<div style="${style}">${emoji}</div>`,
+        iconSize:   [24,24],
+        iconAnchor: [12,12]
+    });
+}
+
+function updateCar(id, lat, lon, state) {
+    const icon = makeCarIcon(state);
+    if (!cars[id]) {
+        cars[id] = { marker: L.marker([lat,lon],{icon}).addTo(map), state };
+    } else {
+        cars[id].marker.setLatLng([lat,lon]);
+        if (cars[id].state !== state) {
+            cars[id].marker.setIcon(icon);
+            cars[id].state = state;
+        }
+    }
+}
+
+function fetchPositions() {
+    fetch("http://localhost:8090/positions")
+        .then(function(r){ return r.json(); })
+        .then(function(data) {
+            const seen = new Set();
+            (data.positions || []).forEach(function(p) {
+                updateCar(p.car_id, p.lat, p.lon, p.state || 'driving');
+                seen.add(p.car_id);
+            });
+            // remove markers for cars no longer reported
+            Object.keys(cars).forEach(function(id) {
+                if (!seen.has(Number(id))) {
+                    cars[id].marker.remove();
+                    delete cars[id];
+                }
+            });
+        })
+        .catch(function(){});
+}
+
+/* ── congestion polylines ── */
+const congestionLines = {};
+
+function jamColor(occ, cap) {
+    const ratio = Math.min(occ / Math.max(cap, 1), 1.0);
+    // hue: 30 (orange) → 0 (red) as ratio goes 0→1
+    const hue = Math.round((1 - ratio) * 30);
+    const lightness = 45;
+    return `hsl(${hue},100%,${lightness}%)`;
+}
+
+function fetchCongestion() {
+    fetch("http://localhost:8090/congestion")
+        .then(function(r){ return r.json(); })
+        .then(function(data) {
+            const seen = new Set();
+            (data.congestion || []).forEach(function(e) {
+                seen.add(e.id);
+                const color  = jamColor(e.occ, e.cap);
+                const weight = Math.min(2 + e.occ, 8);
+                const latlngs = [[e.from_lat, e.from_lon],[e.to_lat, e.to_lon]];
+                if (!congestionLines[e.id]) {
+                    congestionLines[e.id] = L.polyline(latlngs, {
+                        color, weight, opacity: 0.85
+                    }).addTo(map);
+                } else {
+                    congestionLines[e.id].setLatLngs(latlngs);
+                    congestionLines[e.id].setStyle({color, weight});
+                }
+            });
+            // remove polylines for edges with no cars
+            Object.keys(congestionLines).forEach(function(id) {
+                if (!seen.has(Number(id))) {
+                    congestionLines[id].remove();
+                    delete congestionLines[id];
+                }
+            });
+        })
+        .catch(function(){});
+}
+
+/* ── metrics panel ── */
+function fetchMetrics() {
+    fetch("http://localhost:8090/metrics")
+        .then(function(r){ return r.json(); })
+        .then(function(d) {
+            document.getElementById('m-driving').textContent = d.driving;
+            document.getElementById('m-arrived').textContent = d.arrived;
+            document.getElementById('m-waiting').textContent = d.waiting;
+            document.getElementById('m-total'  ).textContent = d.total;
+        })
+        .catch(function(){});
+}
+
+/* ── polling ── */
+setInterval(fetchPositions,  500);
+setInterval(fetchCongestion, 500);
+setInterval(fetchMetrics,    500);
+
+fetchPositions();
+fetchCongestion();
+fetchMetrics();
+
+</script>
+
+</body>
+</html>
