@@ -94,34 +94,31 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
 
 /* ── car markers ── */
 const cars = {};
+const carRenderer = L.canvas({ padding: 0.5 });
 
-function makeCarIcon(state) {
+function markerStyle(state) {
     const styles = {
-        driving: 'font-size:20px;line-height:1;filter:drop-shadow(0 0 3px #1e88e5)',
-        arrived: 'font-size:18px;line-height:1;filter:drop-shadow(0 0 3px #43a047)',
-        idle:    'font-size:18px;line-height:1;filter:drop-shadow(0 0 3px #fb8c00);opacity:0.8'
+        driving: { color: '#1e88e5', fillColor: '#4fc3f7', radius: 4.5, fillOpacity: 0.9, weight: 1.2 },
+        arrived: { color: '#2e7d32', fillColor: '#81c784', radius: 4.0, fillOpacity: 0.85, weight: 1.2 },
+        idle:    { color: '#ef6c00', fillColor: '#ffb74d', radius: 3.5, fillOpacity: 0.75, weight: 1.0 }
     };
-    const emojis = { driving: '🚗', arrived: '🏁', idle: '⏳' };
-    const style  = styles[state] || styles.driving;
-    const emoji  = emojis[state] || '🚗';
-    return L.divIcon({
-        className: '',
-        html: `<div style="${style}">${emoji}</div>`,
-        iconSize:   [24,24],
-        iconAnchor: [12,12]
-    });
+    return styles[state] || styles.driving;
 }
 
 function updateCar(id, lat, lon, state) {
-    const icon = makeCarIcon(state);
+    const style = markerStyle(state);
     if (!cars[id]) {
-        cars[id] = { marker: L.marker([lat,lon],{icon}).addTo(map), state };
-    } else {
-        cars[id].marker.setLatLng([lat,lon]);
-        if (cars[id].state !== state) {
-            cars[id].marker.setIcon(icon);
-            cars[id].state = state;
-        }
+        cars[id] = {
+            marker: L.circleMarker([lat, lon], { ...style, renderer: carRenderer }).addTo(map),
+            state
+        };
+        return;
+    }
+
+    cars[id].marker.setLatLng([lat, lon]);
+    if (cars[id].state !== state) {
+        cars[id].marker.setStyle(style);
+        cars[id].state = state;
     }
 }
 

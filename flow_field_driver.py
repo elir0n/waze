@@ -676,9 +676,12 @@ def run(args: argparse.Namespace) -> None:
     num_cars = args.cars
     cars: List[Car] = []
     registered = 0
+    attempts = 0
+    max_attempts = max(num_cars * 20, 100)
 
     print(f"[init] Registering {num_cars} cars …")
-    for i in range(num_cars):
+    while registered < num_cars and attempts < max_attempts:
+        attempts += 1
         # Pick a random start area and a different destination area
         src_aid = rng.choice(routable)
         dst_candidates = [a for a in routable if a != src_aid]
@@ -695,20 +698,24 @@ def run(args: argparse.Namespace) -> None:
             continue
 
         car = Car(
-            car_id=i,
+            car_id=registered,
             cur_node=start,
             dst_node=dest,
             cur_area_id=src_aid,
             dst_area_id=dst_aid,
             route=route,
         )
-        cars.append(car)
         if register_route(conn, car):
+            cars.append(car)
             registered += 1
-        else:
-            cars.pop()
+        elif attempts % 100 == 0:
+            print(f"[init] register retries: {attempts} attempts, {registered}/{num_cars} cars ready.")
 
-    print(f"[init] {registered}/{num_cars} cars registered. "
+    if registered < num_cars:
+        print(f"[init] WARNING: only {registered}/{num_cars} cars registered after {attempts} attempts.",
+              file=sys.stderr)
+
+    print(f"[init] {registered}/{num_cars} cars registered after {attempts} attempts. "
           f"Route cache: {len(_route_cache)} entries.\n")
 
     # ------------------------------------------------------------------
