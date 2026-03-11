@@ -1,0 +1,62 @@
+services:
+
+  # C routing server — downloads graph on first run, then listens on :8080
+  server:
+    build: .
+    command: ["bash", "-c", "[ -f /app/data/graph.meta ] || python3 /app/scripts/download_tel_aviv.py --out /app/data && exec /app/server"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - graph_data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('127.0.0.1', 8080), 2).close()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 150s   # allow time for OSM download on first run
+
+  # Flow-field simulation — 500 cars, pre-computed sector flow fields.
+  # Has a built-in HTTP bridge: open http://localhost:8090/map.html
+  flow-sim:
+    build: .
+    command: >
+      python3 flow_field_driver.py
+        --host server --port 8080
+        --data-dir /app/data
+        --cars 500
+    ports:
+      - "8090:8090"
+    volumes:
+      - graph_data:/app/data
+    depends_on:
+      server:
+        condition: service_healthy
+
+  # ── Alternative: smaller-scale per-car simulation ──────────────────────
+  # Conflicts with flow-sim on port 8090; stop flow-sim first.
+  # Usage:  docker compose --profile car-sim up --scale flow-sim=0
+  bridge:
+    build: .
+    command: python3 gui/bridge.py --server-host server --server-port 8080
+    ports:
+      - "8090:8090"
+    depends_on:
+      server:
+        condition: service_healthy
+    profiles: [car-sim]
+
+  sim:
+    build: .
+    command: >
+      python3 car_client.py
+        --host server --port 8080
+        --mode sim --graph-dir /app/data
+    volumes:
+      - graph_data:/app/data
+    depends_on:
+      server:
+        condition: service_healthy
+    profiles: [car-sim]
+
+volumes:
+  graph_data:   # persists graph CSVs + flow-field cache across restarts
