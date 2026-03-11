@@ -10,6 +10,7 @@ Inspired by real navigation systems: concurrent clients, live A\* routing, EMA-s
 - [Overview](#overview)
 - [Screenshots](#screenshots)
 - [Architecture](#architecture)
+- [Docker (quickest start)](#docker-quickest-start)
 - [Getting Started](#getting-started)
 - [Graph Data](#graph-data)
 - [Protocol](#protocol)
@@ -119,6 +120,32 @@ cong_factor     = max(0.1, 1.0 − occupancy / capacity)
 ```
 
 `TICK_ALL` pre-computes a single occupancy array for all edges before advancing any car — O(N) instead of O(N²).
+
+---
+
+## Docker (quickest start)
+
+```bash
+docker compose up
+```
+
+That's it. On first run the container downloads the Tel Aviv street network from OpenStreetMap (~1–2 min, one-time), builds the flow-field cache (~30 s, one-time), then starts 500 simulated cars.
+
+Open **http://localhost:8090/map.html** to see cars moving in real time. Subsequent `docker compose up` calls start instantly from the cached data.
+
+```bash
+# Reset all cached data (forces fresh OSM download + flow-field rebuild)
+docker compose down -v
+```
+
+### Simulation modes
+
+| Mode | Command | Cars | Routing |
+|---|---|---|---|
+| **Flow-field** (default) | `docker compose up` | 500+ | Pre-computed sector flow fields; one `TICK_ALL` per tick |
+| **Car simulation** | `docker compose --profile car-sim up --scale flow-sim=0` | ~10–100 | Per-car A\* via individual TCP calls |
+
+The flow-field mode scales much better and is the recommended default. The car simulation mode gives finer per-car control and is useful for debugging or interactive routing.
 
 ---
 

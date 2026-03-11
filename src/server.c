@@ -29,12 +29,18 @@
 #define MAX_CARS 30000
 #endif
 
-/* Congestion model:
+/* Congestion physics:
  * Road class (0–5) is derived from road_type and controls two parameters:
- *   cars_per_lane  = 3 + class*2   (density before jamming: 3 on residential → 13 on motorway)
- *   min_speed_frac = 0.05 + class*0.05  (speed floor: 5% on residential → 30% on motorway)
- * Capacity = lanes * cars_per_lane.
- * Speed drops linearly from base_speed (0 cars) to min_speed_frac*base_speed (at capacity). */
+ *   meters_per_car — physical headway (m) at which the road reaches capacity:
+ *                    8 m (residential) → 25 m (motorway)
+ *   min_speed_frac — speed floor (jam minimum): 0.05 (residential) → 0.30 (motorway)
+ *
+ * Capacity = lanes * floor(base_length / meters_per_car(cls)), minimum 1 per lane.
+ * This ensures a 500m road holds proportionally more cars than a 50m road.
+ *
+ * Speed drops linearly from base_speed (0 cars) to min_speed_frac*base_speed (at capacity).
+ *
+ * Congestion is reported to clients only when occupancy exceeds 30% of capacity. */
 
 static int road_class(const char* road_type) {
     if (!road_type) return 0;
@@ -46,8 +52,22 @@ static int road_class(const char* road_type) {
     return 0;  /* residential, living_street, unclassified, road, … */
 }
 
-/* Returns cars-per-lane capacity for a given road class. */
-static int cars_per_lane(int cls) { return 3 + cls * 2; }
+/* Average headway (metres/car) at capacity, by road class.
+ * cls 0 residential: 8m, cls1 tertiary: 10m, cls2 secondary: 12m,
+ * cls3 primary: 15m, cls4 trunk: 20m, cls5 motorway: 25m */
+static double meters_per_car(int cls) {
+    static const double tbl[6] = { 8.0, 10.0, 12.0, 15.0, 20.0, 25.0 };
+    return tbl[(cls >= 0 && cls <= 5) ? cls : 0];
+}
+
+/* Physical capacity: how many cars fit on this edge (lanes × floor(length / headway)).
+ * Minimum 1 per lane so very short OSM stub edges are handled correctly. */
+static int edge_capacity(double length_m, int lanes, int cls) {
+    int per_lane = (int)(length_m / meters_per_car(cls));
+    if (per_lane < 1) per_lane = 1;
+    int cap = lanes * per_lane;
+    return (cap > 0) ? cap : 1;
+}
 
 /* Returns minimum speed fraction (jam floor) for a given road class. */
 static double jam_floor(int cls) { return 0.05 + cls * 0.05; }
@@ -615,8 +635,8 @@ static char* handle_tick(ServerState* st, int car_id, double dt)
          * jam_floor * base_speed (at capacity). Both capacity and floor depend
          * on road class (derived from road_type) and lane count. */
         int    cls         = road_class(st->g->edges[eid].road_type);
-        int    capacity    = st->g->edges[eid].lanes * cars_per_lane(cls);
-        if (capacity <= 0) capacity = cars_per_lane(cls);
+        int    capacity    = edge_capacity(st->g->edges[eid].base_length,
+                                           st->g->edges[eid].lanes, cls);
         int    occupancy   = count_cars_on_edge(&st->vehicles, eid);
         double cong_factor = 1.0 - (double)occupancy / (double)capacity;
         if (cong_factor < jam_floor(cls)) cong_factor = jam_floor(cls);
@@ -765,13 +785,13 @@ static char* handle_congestion(ServerState* st)
     int first = 1;
 
     for (int eid = 0; eid < num_edges && n > 0 && (size_t)n < buf_sz; eid++) {
-        if (occ[eid] < 2) continue;  /* single car is not congestion */
+        if (occ[eid] == 0) continue;
         Edge* e = &st->g->edges[eid];
         int from = e->from_node;
         int to   = e->to_node;
         int cls  = road_class(e->road_type);
-        int cap  = e->lanes * cars_per_lane(cls);
-        if (cap <= 0) cap = cars_per_lane(cls);
+        int cap  = edge_capacity(e->base_length, e->lanes, cls);
+        if ((double)occ[eid] / (double)cap < 0.3) continue;
 
         n += snprintf(resp + n, buf_sz - (size_t)n,
                       "%s{\"id\":%d,"
@@ -906,8 +926,8 @@ static char* handle_tick_all(ServerState* st, double dt)
             if (base_speed <= 0.0) base_speed = 1.0;
 
             int    cls      = road_class(st->g->edges[eid].road_type);
-            int    capacity = st->g->edges[eid].lanes * cars_per_lane(cls);
-            if (capacity <= 0) capacity = cars_per_lane(cls);
+            int    capacity = edge_capacity(st->g->edges[eid].base_length,
+                                            st->g->edges[eid].lanes, cls);
             int    occupancy = (eid >= 0 && eid < num_edges) ? occ[eid] : 0;
             double cong = 1.0 - (double)occupancy / (double)capacity;
             if (cong < jam_floor(cls)) cong = jam_floor(cls);

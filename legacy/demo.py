@@ -45,11 +45,14 @@ if __package__ is None:
 
 from flow_field.grid   import Grid, GridBounds
 from flow_field.fields import build_fields
-from flow_field.agents import (
-    Agent, SpatialHash, update_agents, sample_flow_bilinear
-)
 from flow_field.loader import (
     load_graph_to_grid, cells_in_world_box
+)
+# agents.py was moved to legacy/ alongside this file
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from agents import (
+    Agent, SpatialHash, update_agents, sample_flow_bilinear
 )
 
 

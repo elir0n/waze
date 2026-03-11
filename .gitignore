@@ -1,4 +1,2 @@
 server
-data/*
-!data/.gitkeep
 CLAUDE.md
