@@ -47,8 +47,11 @@ This project implements the core of a navigation system from scratch:
 
 ## Screenshots
 
-<!-- Add map screenshots here -->
-> _Live map screenshots coming soon._
+### Full map — 1000 cars on the Tel Aviv street network
+![Live map overview](screenshot/localhost_8090_map.html.png)
+
+### Road hover — real-time metrics per road segment
+![Road hover tooltip](screenshot/road_hover_feature.png)
 
 ---
 
@@ -341,7 +344,9 @@ The C server speaks TCP; the browser needs HTTP. `bridge.py` runs two things in 
 Built with Leaflet.js on OpenStreetMap tiles.
 
 - **Car markers**: colored by state — driving (blue), arrived (green), idle (orange)
-- **Congestion overlay**: road segments colored by occupancy — orange (< 50% capacity), red (> 80%)
+- **Road overlay**: all road segments are drawn on startup from the graph data and updated every 500ms
+- **Congestion overlay**: road segments colored by occupancy — orange (light), red (heavy)
+- **Road hover tooltips**: hover over any road segment to see its real-time metrics — road type, speed limit, and current number of cars on that segment
 - **Live metrics panel**: driving / arrived / idle / total counts, updated every 500ms
 
 ### Desktop launcher (`gui/gui.py`)
