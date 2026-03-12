@@ -47,11 +47,13 @@ This project implements the core of a navigation system from scratch:
 
 ## Screenshots
 
-### Full map — 1000 cars on the Tel Aviv street network
-![Live map overview](screenshot/localhost_8090_map.html.png)
-
-### Road hover — real-time metrics per road segment
-![Road hover tooltip](screenshot/road_hover_feature.png)
+<div align="center">
+  <img src="screenshot/localhost_8090_map.html.png" width="56%" alt="Live map — 1000 cars on Tel Aviv"/>
+  &nbsp;
+  <img src="screenshot/road_hover_feature.png" width="38%" alt="Road hover tooltip"/>
+  <br/>
+  <sub><b>Left:</b> 1000 simulated cars on the Tel Aviv street network &nbsp;|&nbsp; <b>Right:</b> hover any road to inspect its live metrics</sub>
+</div>
 
 ---
 
