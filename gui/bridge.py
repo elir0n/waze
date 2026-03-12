@@ -13,6 +13,8 @@ Then open: http://localhost:8090/map.html
 """
 
 import argparse
+import csv
+import gzip
 import json
 import os
 import socket
@@ -101,6 +103,40 @@ class DataPoller(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# Static edge loader for /edges endpoint
+# ---------------------------------------------------------------------------
+
+_edges_gz: bytes = b""
+
+
+def _load_edges_gz() -> bytes:
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
+    nodes: dict = {}
+    with open(os.path.join(base, "nodes.csv"), newline="") as f:
+        for row in csv.DictReader(f):
+            nodes[int(row["node_id"])] = (float(row["lat"]), float(row["lon"]))
+    edges = []
+    with open(os.path.join(base, "edges.csv"), newline="") as f:
+        for row in csv.DictReader(f):
+            fn, tn = int(row["from_node"]), int(row["to_node"])
+            if fn not in nodes or tn not in nodes:
+                continue
+            flat, flon = nodes[fn]
+            tlat, tlon = nodes[tn]
+            speed = float(row.get("base_speed_limit") or row.get("speed_limit") or 50)
+            edges.append({
+                "id":    int(row["edge_id"]),
+                "flat":  round(flat,  5), "flon": round(flon,  5),
+                "tlat":  round(tlat,  5), "tlon": round(tlon,  5),
+                "speed": speed,
+                "lanes": int(row["lanes"]),
+                "rtype": row["road_type"],
+            })
+    raw = json.dumps({"edges": edges}, separators=(',', ':')).encode()
+    return gzip.compress(raw, compresslevel=6)
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -117,6 +153,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/metrics":
             self._send_json(_poller.get_metrics())
+
+        elif self.path == "/edges":
+            if not _edges_gz:
+                self._send_json({"edges": []})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(_edges_gz)))
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(_edges_gz)
 
         elif self.path in ("/", "/map.html"):
             html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map.html")
@@ -166,6 +214,13 @@ def main():
     ap.add_argument("--interval",    type=float, default=0.5,
                     help="Polling interval in seconds (default 0.5)")
     args = ap.parse_args()
+
+    global _edges_gz
+    try:
+        _edges_gz = _load_edges_gz()
+        print(f"[bridge] /edges ready ({len(_edges_gz):,} bytes gzipped)")
+    except Exception as e:
+        print(f"[bridge] WARNING: /edges unavailable: {e}", file=sys.stderr)
 
     _poller = DataPoller(args.server_host, args.server_port, args.interval)
     _poller.start()

@@ -15,7 +15,7 @@ services:
       retries: 30
       start_period: 150s   # allow time for OSM download on first run
 
-  # Flow-field simulation — 500 cars, pre-computed sector flow fields.
+  # Flow-field simulation — 1000 cars, pre-computed sector flow fields.
   # Has a built-in HTTP bridge: open http://localhost:8090/map.html
   flow-sim:
     build: .
@@ -23,7 +23,7 @@ services:
       python3 flow_field_driver.py
         --host server --port 8080
         --data-dir /app/data
-        --cars 500
+        --cars 1000
     ports:
       - "8090:8090"
     volumes:

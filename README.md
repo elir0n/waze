@@ -129,7 +129,7 @@ cong_factor     = max(0.1, 1.0 − occupancy / capacity)
 docker compose up
 ```
 
-That's it. On first run the container downloads the Tel Aviv street network from OpenStreetMap (~1–2 min, one-time), builds the flow-field cache (~30 s, one-time), then starts 500 simulated cars.
+That's it. On first run the container downloads the Tel Aviv street network from OpenStreetMap (~1–2 min, one-time), builds the flow-field cache (~30 s, one-time), then starts 1000 simulated cars.
 
 Open **http://localhost:8090/map.html** to see cars moving in real time. Subsequent `docker compose up` calls start instantly from the cached data.
 

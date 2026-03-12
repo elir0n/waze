@@ -142,8 +142,9 @@ function fetchPositions() {
         .catch(function(){});
 }
 
-/* ── congestion polylines ── */
-const congestionLines = {};
+/* ── edge layer (all roads) + congestion overlay ── */
+const edgeLayer = new Map();   // edge_id → { polyline, speed, lanes, rtype }
+let prevCongested = new Set();
 
 function jamColor(occ, cap) {
     const ratio = Math.min(occ / Math.max(cap, 1), 1.0);
@@ -153,34 +154,65 @@ function jamColor(occ, cap) {
     return `hsl(${hue},100%,${lightness}%)`;
 }
 
+function buildTooltip(speed, lanes, rtype, cars) {
+    return `<div style="font:12px monospace;line-height:1.7">` +
+           `<b>${rtype}</b><br>` +
+           `Speed: ${speed} km/h<br>` +
+           `Lanes: ${lanes}<br>` +
+           `Cars: ${cars}</div>`;
+}
+
+function initEdgeLayer() {
+    fetch("http://localhost:8090/edges")
+        .then(r => r.json())
+        .then(data => {
+            (data.edges || []).forEach(e => {
+                const pl = L.polyline(
+                    [[e.flat, e.flon], [e.tlat, e.tlon]],
+                    { color: '#888', weight: 3, opacity: 0.5, interactive: true }
+                ).addTo(map);
+                pl.bindTooltip(buildTooltip(e.speed, e.lanes, e.rtype, 0),
+                               { sticky: true, opacity: 0.92 });
+                edgeLayer.set(e.id, { polyline: pl, speed: e.speed,
+                                      lanes: e.lanes, rtype: e.rtype });
+            });
+            console.log(`[map] ${edgeLayer.size} edges loaded`);
+        })
+        .catch(err => console.warn('[map] /edges failed:', err));
+}
+
 function fetchCongestion() {
     fetch("http://localhost:8090/congestion")
-        .then(function(r){ return r.json(); })
-        .then(function(data) {
-            const seen = new Set();
-            (data.congestion || []).forEach(function(e) {
-                seen.add(e.id);
-                const color  = jamColor(e.occ, e.cap);
-                const weight = Math.min(2 + e.occ, 8);
-                const latlngs = [[e.from_lat, e.from_lon],[e.to_lat, e.to_lon]];
-                if (!congestionLines[e.id]) {
-                    congestionLines[e.id] = L.polyline(latlngs, {
-                        color, weight, opacity: 0.85
-                    }).addTo(map);
-                } else {
-                    congestionLines[e.id].setLatLngs(latlngs);
-                    congestionLines[e.id].setStyle({color, weight});
+        .then(r => r.json())
+        .then(data => {
+            const now = new Set();
+            (data.congestion || []).forEach(e => {
+                now.add(e.id);
+                const entry = edgeLayer.get(e.id);
+                if (!entry) return;
+                entry.polyline.setStyle({
+                    color: jamColor(e.occ, e.cap),
+                    weight: Math.min(2 + e.occ, 8),
+                    opacity: 0.85
+                });
+                entry.polyline.setTooltipContent(
+                    buildTooltip(entry.speed, entry.lanes, entry.rtype, e.occ));
+                entry.polyline.bringToFront();
+            });
+            // Reset edges that dropped out of congestion since last tick
+            prevCongested.forEach(id => {
+                if (!now.has(id)) {
+                    const entry = edgeLayer.get(id);
+                    if (entry) {
+                        entry.polyline.setStyle({ color: '#888', weight: 1.5, opacity: 0.35 });
+                        entry.polyline.setTooltipContent(
+                            buildTooltip(entry.speed, entry.lanes, entry.rtype, 0));
+                    }
                 }
             });
-            // remove polylines for edges with no cars
-            Object.keys(congestionLines).forEach(function(id) {
-                if (!seen.has(Number(id))) {
-                    congestionLines[id].remove();
-                    delete congestionLines[id];
-                }
-            });
+            prevCongested = now;
         })
-        .catch(function(){});
+        .catch(() => {});
 }
 
 /* ── metrics panel ── */
@@ -197,13 +229,14 @@ function fetchMetrics() {
 }
 
 /* ── polling ── */
-setInterval(fetchPositions,  500);
-setInterval(fetchCongestion, 500);
-setInterval(fetchMetrics,    500);
-
+initEdgeLayer();       // async one-time fetch of all road geometries
 fetchPositions();
 fetchCongestion();
 fetchMetrics();
+
+setInterval(fetchPositions,  500);
+setInterval(fetchCongestion, 500);
+setInterval(fetchMetrics,    500);
 
 </script>
 
