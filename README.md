@@ -149,6 +149,10 @@ This downloads the Tel Aviv drive network from OpenStreetMap and writes `data/no
 ### Step 2 — Run with Docker
 
 ```bash
+docker compose bulid
+```
+
+```bash
 docker compose up
 ```
 
@@ -158,9 +162,37 @@ Builds the C server, starts 500 simulated cars, and exposes the live map at **ht
 
 ---
 
-## 5. Experiments
+## 5. User Navigation
 
-### 5.1 Effect of Threading on Routing Throughput
+The live map includes an interactive navigation panel that lets you plan and follow a route alongside the simulated traffic.
+
+### Selecting Source & Destination
+
+Pick origin and destination nodes using **Browse list** (searchable node list) or **Click map** (click directly on the map to snap to the nearest node). Selected nodes are marked with a red dot on the map.
+
+![Navigation panel with source selected](screenshots/pick_source.png)
+
+![Both source and destination selected](screenshots/pick_destination.png)
+
+### Route & ETA Confirmation
+
+After clicking **Navigate**, the server computes the optimal A\* route and displays the estimated travel time. Click **Start Journey** to begin, or **Cancel** to go back.
+
+![ETA confirmation dialog](screenshots/eta_dialog.png)
+
+### Following Your Car
+
+Once the journey starts, your car appears as a pulsing icon on the map. The map centers on the source node and tracks your car in real time among the simulated traffic. When you arrive, a status message confirms it.
+
+Click **New Trip** to reset and plan another route.
+
+![Live map overview](screenshots/nav_panel.png)
+
+---
+
+## 6. Experiments
+
+### 6.1 Effect of Threading on Routing Throughput
 
 **Setup**: 2000-node / 6000-edge graph; 32 concurrent clients each sending 50 routing requests (1600 total). Server compiled with varying `ROUTE_WORKERS`.
 

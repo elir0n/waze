@@ -562,7 +562,14 @@ def update_positions_cache(resp: dict) -> None:
 
 def get_positions_json() -> str:
     with _positions_lock:
-        return json.dumps({"positions": _positions_cache["positions"]})
+        positions = list(_positions_cache["positions"])
+    with _user_car_lock:
+        user_car_ids = set(_user_cars.keys())
+    if user_car_ids:
+        for p in positions:
+            if p.get("car_id") in user_car_ids:
+                p["user_car"] = True
+    return json.dumps({"positions": positions})
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +586,24 @@ def _get_http_conn(host: str, port: int) -> ServerConn:
         if _http_conn is None:
             _http_conn = ServerConn(host, port, timeout=5.0)
         return _http_conn
+
+
+def _load_nodes_gz(data_dir: str) -> tuple:
+    """Returns (gzipped_json_bytes, node_id_to_index_dict)."""
+    nodes = []
+    id_to_index = {}
+    with open(os.path.join(data_dir, "nodes.csv"), newline="") as f:
+        for idx, row in enumerate(csv.DictReader(f)):
+            node_id = int(row["node_id"])
+            id_to_index[node_id] = idx
+            nodes.append({
+                "id":  node_id,
+                "lat": round(float(row["lat"]), 6),
+                "lon": round(float(row["lon"]), 6),
+            })
+    nodes.sort(key=lambda x: x["id"])
+    raw = json.dumps({"nodes": nodes}, separators=(',', ':')).encode()
+    return gzip.compress(raw, compresslevel=6), id_to_index
 
 
 def _load_edges_gz(data_dir: str) -> bytes:
@@ -607,10 +632,55 @@ def _load_edges_gz(data_dir: str) -> bytes:
     return gzip.compress(raw, compresslevel=6)
 
 
+_USER_CAR_USER_ID  = 9999
+_USER_CAR_ID_START = 100_000
+_user_car_counter  = _USER_CAR_ID_START
+_user_car_lock     = threading.Lock()
+_user_cars: Dict[int, dict] = {}   # car_id -> {"state": str}
+
+
+def _tcp_query(host: str, port: int, command: bytes) -> bytes:
+    """Open a one-shot TCP connection, send command, read one line response."""
+    with socket.create_connection((host, port), timeout=2.0) as s:
+        s.sendall(command)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    return buf
+
+
+def _tick_user_cars_loop(host: str, port: int, interval: float) -> None:
+    """Background thread: advance user-registered cars on the C server."""
+    while True:
+        with _user_car_lock:
+            active = [cid for cid, info in _user_cars.items()
+                      if info["state"] != "arrived"]
+        for car_id in active:
+            payload = json.dumps(
+                {"tick_car": 1, "car_id": car_id, "dt": interval},
+                separators=(',', ':')
+            ).encode() + b"\n"
+            try:
+                buf = _tcp_query(host, port, payload)
+                resp = json.loads(buf.decode().strip())
+                if resp.get("cmd") == "ARRIVED":
+                    with _user_car_lock:
+                        if car_id in _user_cars:
+                            _user_cars[car_id]["state"] = "arrived"
+            except Exception as e:
+                print(f"[http] tick user car {car_id}: {e}", file=sys.stderr)
+        time.sleep(interval)
+
+
 class _Handler(BaseHTTPRequestHandler):
     c_host: str = "127.0.0.1"
     c_port: int = 8080
     edges_gz: bytes = b""
+    nodes_gz: bytes = b""
+    node_id_to_index: Dict[int, int] = {}
 
     def log_message(self, fmt, *args):
         pass
@@ -622,6 +692,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_json(self, obj: dict) -> None:
+        self._send(200, "application/json", json.dumps(obj).encode())
+
+    def _send_error(self, code: int, msg: str) -> None:
+        self._send(code, "application/json",
+                   json.dumps({"error": msg}).encode())
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -666,6 +750,19 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(gz)
 
+        elif path in ("/nodes", "/nodes/"):
+            gz = _Handler.nodes_gz
+            if not gz:
+                self._send(200, "application/json", b'{"nodes":[]}')
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(gz)))
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(gz)
+
         elif path in ("/map.html", "/"):
             map_path = os.path.join(os.path.dirname(__file__), "gui", "map.html")
             try:
@@ -678,6 +775,57 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"Not found")
 
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path in ("/navigate", "/navigate/"):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                req = json.loads(body)
+                src = int(req["src"])
+                dst = int(req["dst"])
+            except (KeyError, ValueError, json.JSONDecodeError) as e:
+                self._send_error(400, f"Bad request: {e}")
+                return
+
+            src_idx = _Handler.node_id_to_index.get(src)
+            dst_idx = _Handler.node_id_to_index.get(dst)
+            if src_idx is None or dst_idx is None:
+                self._send_error(400, f"Unknown node ID(s): src={src}, dst={dst}")
+                return
+
+            global _user_car_counter
+            with _user_car_lock:
+                car_id = _user_car_counter
+                _user_car_counter += 1
+
+            payload = json.dumps({
+                "register_car": 1,
+                "user_id": _USER_CAR_USER_ID,
+                "car_id": car_id,
+                "start_node": src_idx,
+                "destination_node": dst_idx,
+                "timestamp": 0.0,
+            }, separators=(',', ':')).encode() + b"\n"
+
+            try:
+                buf = _tcp_query(self.c_host, self.c_port, payload)
+                resp = json.loads(buf.decode().strip())
+                if resp.get("status") != "REGISTERED":
+                    self._send_error(500, resp.get("error", "REGISTER_FAILED"))
+                    return
+                with _user_car_lock:
+                    _user_cars[car_id] = {"state": "driving"}
+                self._send_json({
+                    "car_id": car_id,
+                    "eta": round(float(resp.get("eta", 0.0)), 2),
+                    "status": "REGISTERED",
+                })
+            except Exception as e:
+                self._send_error(500, str(e))
+        else:
+            self._send(404, "text/plain", b"Not found")
+
 
 def start_http_server(http_port: int, c_host: str, c_port: int, data_dir: str) -> None:
     _Handler.c_host = c_host
@@ -687,6 +835,18 @@ def start_http_server(http_port: int, c_host: str, c_port: int, data_dir: str) -
         print(f"[http] /edges ready ({len(_Handler.edges_gz):,} bytes gzipped)")
     except Exception as e:
         print(f"[http] WARNING: /edges unavailable: {e}", file=sys.stderr)
+    try:
+        _Handler.nodes_gz, _Handler.node_id_to_index = _load_nodes_gz(data_dir)
+        print(f"[http] /nodes ready ({len(_Handler.nodes_gz):,} bytes gzipped, "
+              f"{len(_Handler.node_id_to_index)} nodes mapped)")
+    except Exception as e:
+        print(f"[http] WARNING: /nodes unavailable: {e}", file=sys.stderr)
+
+    # Background thread to tick user-registered cars
+    tick_t = threading.Thread(target=_tick_user_cars_loop,
+                              args=(c_host, c_port, 0.5), daemon=True)
+    tick_t.start()
+
     httpd = HTTPServer(("", http_port), _Handler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()

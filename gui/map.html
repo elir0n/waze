@@ -58,18 +58,273 @@ html, body, #map { height:100%; margin:0; }
     border-radius: 2px;
     display: inline-block;
 }
+
+/* ── Navigation panel ── */
+#nav-panel {
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    z-index: 1000;
+    background: rgba(20,20,20,0.90);
+    color: #fff;
+    font: 14px/1.6 monospace;
+    padding: 14px 18px;
+    border-radius: 8px;
+    min-width: 240px;
+    max-width: 280px;
+}
+#nav-panel h3 {
+    margin: 0 0 10px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: #aaa;
+}
+#nav-panel label {
+    display: block;
+    font-size: 11px;
+    color: #aaa;
+    margin-bottom: 3px;
+}
+#nav-panel input[type=text] {
+    width: 100%;
+    box-sizing: border-box;
+    background: #333;
+    border: 1px solid #555;
+    border-radius: 4px;
+    color: #fff;
+    font: 13px monospace;
+    padding: 5px 8px;
+    margin-bottom: 4px;
+}
+#nav-panel input[type=text]:focus { outline: 1px solid #4fc3f7; }
+.nav-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+.btn-browse {
+    flex: 1;
+    padding: 4px 0;
+    background: #3a3a3a;
+    color: #bbb;
+    border: 1px solid #555;
+    border-radius: 4px;
+    font: 11px monospace;
+    cursor: pointer;
+}
+.btn-browse:hover { background: #4a4a4a; }
+#btn-navigate {
+    width: 100%;
+    padding: 8px 0;
+    background: #1e88e5;
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    font: 13px/1.4 monospace;
+    cursor: pointer;
+    margin-top: 2px;
+}
+#btn-navigate:hover:not(:disabled) { background: #1565c0; }
+#btn-navigate:disabled { background: #555; color: #888; cursor: default; }
+#btn-new-trip {
+    display: none;
+    width: 100%;
+    padding: 8px 0;
+    background: #e65100;
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    font: 13px/1.4 monospace;
+    cursor: pointer;
+    margin-top: 6px;
+}
+#btn-new-trip:hover { background: #bf360c; }
+#nav-status {
+    margin-top: 8px;
+    font-size: 11px;
+    color: #81c784;
+    min-height: 16px;
+    word-break: break-word;
+}
+
+/* ── Node browser modal ── */
+#node-modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.65);
+    z-index: 2000;
+    align-items: center;
+    justify-content: center;
+}
+#node-modal-overlay.open { display: flex; }
+#node-modal {
+    background: #1e1e1e;
+    border-radius: 10px;
+    padding: 20px;
+    width: 340px;
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    color: #fff;
+    font: 13px monospace;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+}
+#node-modal b { display: block; margin-bottom: 12px; font-size: 14px; }
+#node-search {
+    padding: 6px 10px;
+    background: #333;
+    border: 1px solid #555;
+    border-radius: 4px;
+    color: #fff;
+    font: 13px monospace;
+    margin-bottom: 10px;
+    width: 100%;
+    box-sizing: border-box;
+}
+#node-search:focus { outline: 1px solid #4fc3f7; }
+#node-list {
+    overflow-y: auto;
+    flex: 1;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    border: 1px solid #333;
+    border-radius: 4px;
+}
+#node-list li {
+    padding: 7px 10px;
+    cursor: pointer;
+    border-bottom: 1px solid #2a2a2a;
+    font-size: 12px;
+}
+#node-list li:last-child { border-bottom: none; }
+#node-list li:hover { background: #2d2d2d; }
+#node-list .no-results { color: #666; padding: 12px; text-align: center; cursor: default; }
+#node-list .no-results:hover { background: none; }
+#btn-modal-cancel {
+    margin-top: 10px;
+    background: #444;
+    color: #ccc;
+    border: none;
+    border-radius: 5px;
+    padding: 7px;
+    cursor: pointer;
+    font: 13px monospace;
+    width: 100%;
+}
+#btn-modal-cancel:hover { background: #555; }
+
+/* ── ETA confirmation dialog ── */
+#eta-dialog-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.65);
+    z-index: 2000;
+    align-items: center;
+    justify-content: center;
+}
+#eta-dialog-overlay.open { display: flex; }
+#eta-dialog {
+    background: #1e1e1e;
+    border-radius: 10px;
+    padding: 28px 32px;
+    min-width: 300px;
+    color: #fff;
+    font: 14px monospace;
+    text-align: center;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+}
+#eta-dialog h3 { margin: 0 0 14px; color: #4fc3f7; font-size: 16px; }
+#eta-dialog .eta-label { color: #aaa; font-size: 12px; margin-bottom: 4px; }
+.eta-value { font-size: 32px; font-weight: bold; color: #81c784; margin: 6px 0 10px; }
+#eta-route-info { font-size: 11px; color: #777; margin-bottom: 18px; }
+.dialog-buttons { display: flex; gap: 12px; justify-content: center; }
+#btn-eta-confirm {
+    background: #1e88e5; color: #fff; border: none; border-radius: 5px;
+    padding: 10px 26px; font: 14px monospace; cursor: pointer;
+}
+#btn-eta-confirm:hover { background: #1565c0; }
+#btn-eta-cancel {
+    background: #444; color: #ccc; border: none; border-radius: 5px;
+    padding: 10px 26px; font: 14px monospace; cursor: pointer;
+}
+#btn-eta-cancel:hover { background: #555; }
+
+/* ── User car marker pulse ── */
+@keyframes user-car-pulse {
+    0%   { text-shadow: 0 0 4px rgba(255,215,0,0.9), 0 0 12px rgba(255,215,0,0.6); }
+    50%  { text-shadow: 0 0 8px rgba(255,215,0,1),   0 0 24px rgba(255,215,0,0.8); }
+    100% { text-shadow: 0 0 4px rgba(255,215,0,0.9), 0 0 12px rgba(255,215,0,0.6); }
+}
+.user-car-icon {
+    font-size: 28px;
+    line-height: 1;
+    display: block;
+    animation: user-car-pulse 1.8s ease-in-out infinite;
+    cursor: pointer;
+}
 </style>
 </head>
 
 <body>
 
+<!-- Navigation panel (top-left) -->
+<div id="nav-panel">
+    <h3>&#x1F5FA; Navigate</h3>
+
+    <label>Source node</label>
+    <input type="text" id="input-src" placeholder="Node ID or pick from list…"/>
+    <div class="nav-row">
+        <button class="btn-browse" id="btn-browse-src">&#x1F4CB; Browse list</button>
+        <button class="btn-browse" id="btn-pick-src">&#x1F3AF; Click map</button>
+    </div>
+
+    <label>Destination node</label>
+    <input type="text" id="input-dst" placeholder="Node ID or pick from list…"/>
+    <div class="nav-row">
+        <button class="btn-browse" id="btn-browse-dst">&#x1F4CB; Browse list</button>
+        <button class="btn-browse" id="btn-pick-dst">&#x1F3AF; Click map</button>
+    </div>
+
+    <button id="btn-navigate" onclick="onNavigate()">Navigate</button>
+    <button id="btn-new-trip" onclick="onNewTrip()">New Trip</button>
+    <div id="nav-status"></div>
+</div>
+
+<!-- Node browser modal -->
+<div id="node-modal-overlay">
+    <div id="node-modal">
+        <b id="modal-title">Select node</b>
+        <input type="text" id="node-search" placeholder="Search by node ID…" oninput="filterNodes()" autocomplete="off"/>
+        <ul id="node-list"></ul>
+        <button id="btn-modal-cancel" onclick="closeModal()">Cancel</button>
+    </div>
+</div>
+
+<!-- ETA confirmation dialog -->
+<div id="eta-dialog-overlay">
+    <div id="eta-dialog">
+        <h3>&#x1F6E3; Route Found</h3>
+        <div class="eta-label">Estimated travel time</div>
+        <div class="eta-value" id="eta-display">—</div>
+        <div id="eta-route-info"></div>
+        <div class="dialog-buttons">
+            <button id="btn-eta-cancel"  onclick="closeEtaDialog()">Cancel</button>
+            <button id="btn-eta-confirm" onclick="confirmNavigate()">Start Journey</button>
+        </div>
+    </div>
+</div>
+
 <div id="map"></div>
 
 <div id="metrics">
     <h3>Live Traffic</h3>
-    <div class="metric-row"><span>🚗 Driving</span> <span class="metric-val m-driving" id="m-driving">—</span></div>
-    <div class="metric-row"><span>✅ Arrived</span> <span class="metric-val m-arrived" id="m-arrived">—</span></div>
-    <div class="metric-row"><span>⏳ Waiting</span> <span class="metric-val m-waiting" id="m-waiting">—</span></div>
+    <div class="metric-row"><span>&#x1F697; Driving</span> <span class="metric-val m-driving" id="m-driving">—</span></div>
+    <div class="metric-row"><span>&#x2705; Arrived</span> <span class="metric-val m-arrived" id="m-arrived">—</span></div>
+    <div class="metric-row"><span>&#x23F3; Waiting</span> <span class="metric-val m-waiting" id="m-waiting">—</span></div>
     <div class="metric-row" style="border-top:1px solid #444;margin-top:4px;padding-top:4px">
         <span>Total</span> <span class="metric-val m-total" id="m-total">—</span>
     </div>
@@ -92,7 +347,7 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
     maxZoom:19
 }).addTo(map);
 
-/* ── car markers ── */
+/* ── simulation car markers ── */
 const cars = {};
 const carRenderer = L.canvas({ padding: 0.5 });
 
@@ -122,22 +377,60 @@ function updateCar(id, lat, lon, state) {
     }
 }
 
+/* ── user car marker ── */
+let userCarId = null;
+let userCarMarker = null;
+
+function makeUserCarIcon() {
+    return L.divIcon({
+        html: '<span class="user-car-icon">&#x1F697;</span>',
+        iconSize: [36, 36],
+        iconAnchor: [18, 18],
+        className: '',
+    });
+}
+
+function updateUserCar(id, lat, lon, state) {
+    if (!userCarMarker) {
+        userCarMarker = L.marker([lat, lon], {
+            icon: makeUserCarIcon(),
+            zIndexOffset: 1000
+        }).addTo(map).bindPopup('<b>Your car</b><br>ID: ' + id);
+    } else {
+        userCarMarker.setLatLng([lat, lon]);
+    }
+
+    if (state === 'arrived' && userCarId) {
+        setStatus('You have arrived! \u2705', '#81c784');
+        userCarMarker.setPopupContent('<b>Your car</b><br>Arrived!').openPopup();
+    }
+}
+
 function fetchPositions() {
     fetch("http://localhost:8090/positions")
         .then(function(r){ return r.json(); })
         .then(function(data) {
             const seen = new Set();
             (data.positions || []).forEach(function(p) {
-                updateCar(p.car_id, p.lat, p.lon, p.state || 'driving');
+                if (p.user_car) {
+                    updateUserCar(p.car_id, p.lat, p.lon, p.state || 'driving');
+                } else {
+                    updateCar(p.car_id, p.lat, p.lon, p.state || 'driving');
+                }
                 seen.add(p.car_id);
             });
-            // remove markers for cars no longer reported
+            // remove markers for gone simulation cars
             Object.keys(cars).forEach(function(id) {
                 if (!seen.has(Number(id))) {
                     cars[id].marker.remove();
                     delete cars[id];
                 }
             });
+            // remove user car if no longer reported
+            if (userCarMarker && userCarId && !seen.has(userCarId)) {
+                userCarMarker.remove();
+                userCarMarker = null;
+            }
         })
         .catch(function(){});
 }
@@ -154,12 +447,11 @@ function jamColor(occ, cap) {
     return `hsl(${hue},100%,${lightness}%)`;
 }
 
-function buildTooltip(speed, lanes, rtype, cars) {
+function buildTooltip(speed, lanes, rtype) {
     return `<div style="font:12px monospace;line-height:1.7">` +
            `<b>${rtype}</b><br>` +
            `Speed: ${speed} km/h<br>` +
-           `Lanes: ${lanes}<br>` +
-           `Cars: ${cars}</div>`;
+           `Lanes: ${lanes}</div>`;
 }
 
 function initEdgeLayer() {
@@ -171,7 +463,7 @@ function initEdgeLayer() {
                     [[e.flat, e.flon], [e.tlat, e.tlon]],
                     { color: '#888', weight: 3, opacity: 0.5, interactive: true }
                 ).addTo(map);
-                pl.bindTooltip(buildTooltip(e.speed, e.lanes, e.rtype, 0),
+                pl.bindTooltip(buildTooltip(e.speed, e.lanes, e.rtype),
                                { sticky: true, opacity: 0.92 });
                 edgeLayer.set(e.id, { polyline: pl, speed: e.speed,
                                       lanes: e.lanes, rtype: e.rtype });
@@ -196,7 +488,7 @@ function fetchCongestion() {
                     opacity: 0.85
                 });
                 entry.polyline.setTooltipContent(
-                    buildTooltip(entry.speed, entry.lanes, entry.rtype, e.occ));
+                    buildTooltip(entry.speed, entry.lanes, entry.rtype));
                 entry.polyline.bringToFront();
             });
             // Reset edges that dropped out of congestion since last tick
@@ -206,7 +498,7 @@ function fetchCongestion() {
                     if (entry) {
                         entry.polyline.setStyle({ color: '#888', weight: 1.5, opacity: 0.35 });
                         entry.polyline.setTooltipContent(
-                            buildTooltip(entry.speed, entry.lanes, entry.rtype, 0));
+                            buildTooltip(entry.speed, entry.lanes, entry.rtype));
                     }
                 }
             });
@@ -228,8 +520,246 @@ function fetchMetrics() {
         .catch(function(){});
 }
 
+/* ── Nodes data (loaded once for browse modal) ── */
+let allNodes = [];
+
+function loadNodes() {
+    fetch("http://localhost:8090/nodes")
+        .then(r => r.json())
+        .then(data => {
+            allNodes = data.nodes || [];
+            console.log(`[map] ${allNodes.length} nodes loaded`);
+        })
+        .catch(err => console.warn('[map] /nodes failed:', err));
+}
+
+// Find nearest node to a lat/lon (used for map-click picking)
+function nearestNode(lat, lon) {
+    if (!allNodes.length) return null;
+    let best = null, bestDist = Infinity;
+    const cosLat = Math.cos(lat * Math.PI / 180);
+    for (const n of allNodes) {
+        const dlat = n.lat - lat;
+        const dlon = (n.lon - lon) * cosLat;
+        const d = dlat * dlat + dlon * dlon;
+        if (d < bestDist) { bestDist = d; best = n; }
+    }
+    return best;
+}
+
+/* ── Node browser modal ── */
+let modalTarget = null; // 'src' | 'dst'
+
+function openModal(target) {
+    modalTarget = target;
+    document.getElementById('modal-title').textContent =
+        target === 'src' ? 'Select source node' : 'Select destination node';
+    document.getElementById('node-search').value = '';
+    filterNodes();
+    document.getElementById('node-modal-overlay').classList.add('open');
+    document.getElementById('node-search').focus();
+}
+
+function closeModal() {
+    document.getElementById('node-modal-overlay').classList.remove('open');
+    modalTarget = null;
+}
+
+function filterNodes() {
+    const q = document.getElementById('node-search').value.trim();
+    const filtered = q
+        ? allNodes.filter(n => String(n.id).startsWith(q))
+        : allNodes;
+    renderNodeList(filtered.slice(0, 200));
+}
+
+function renderNodeList(nodes) {
+    const ul = document.getElementById('node-list');
+    ul.innerHTML = '';
+    if (!nodes.length) {
+        const li = document.createElement('li');
+        li.className = 'no-results';
+        li.textContent = 'No nodes found';
+        ul.appendChild(li);
+        return;
+    }
+    nodes.forEach(n => {
+        const li = document.createElement('li');
+        li.textContent = `${n.id}  (${n.lat.toFixed(4)}, ${n.lon.toFixed(4)})`;
+        li.addEventListener('click', function() {
+            const field = modalTarget === 'src' ? 'input-src' : 'input-dst';
+            document.getElementById(field).value = n.id;
+            placePickMarker(modalTarget, n.lat, n.lon);
+            closeModal();
+            setStatus(`Node ${n.id} selected`, '#4fc3f7');
+        });
+        ul.appendChild(li);
+    });
+}
+
+/* ── Map-click node picking ── */
+let mapClickMode = null; // 'src' | 'dst' | null
+let srcPickMarker = null;
+let dstPickMarker = null;
+
+const pickMarkerStyle = {
+    radius: 7, color: '#d32f2f', fillColor: '#ef5350',
+    fillOpacity: 0.9, weight: 2
+};
+
+function placePickMarker(target, lat, lon) {
+    if (target === 'src') {
+        if (srcPickMarker) srcPickMarker.setLatLng([lat, lon]);
+        else srcPickMarker = L.circleMarker([lat, lon], pickMarkerStyle).addTo(map);
+    } else {
+        if (dstPickMarker) dstPickMarker.setLatLng([lat, lon]);
+        else dstPickMarker = L.circleMarker([lat, lon], pickMarkerStyle).addTo(map);
+    }
+}
+
+function clearPickMarkers() {
+    if (srcPickMarker) { srcPickMarker.remove(); srcPickMarker = null; }
+    if (dstPickMarker) { dstPickMarker.remove(); dstPickMarker = null; }
+}
+
+map.on('click', function(e) {
+    if (!mapClickMode) return;
+    const nearest = nearestNode(e.latlng.lat, e.latlng.lng);
+    if (!nearest) {
+        setStatus('Nodes not loaded yet. Please wait.', '#ef9a9a');
+        return;
+    }
+    const field = mapClickMode === 'src' ? 'input-src' : 'input-dst';
+    document.getElementById(field).value = nearest.id;
+    placePickMarker(mapClickMode, nearest.lat, nearest.lon);
+    setStatus(`Node ${nearest.id} selected (${mapClickMode === 'src' ? 'source' : 'destination'})`, '#4fc3f7');
+    mapClickMode = null;
+    map.getContainer().style.cursor = '';
+});
+
+function enterPickMode(target) {
+    mapClickMode = target;
+    map.getContainer().style.cursor = 'crosshair';
+    setStatus(`Click map to pick ${target === 'src' ? 'source' : 'destination'} node…`, '#ffb74d');
+}
+
+document.getElementById('btn-browse-src').addEventListener('click', function() { openModal('src'); });
+document.getElementById('btn-browse-dst').addEventListener('click', function() { openModal('dst'); });
+document.getElementById('btn-pick-src').addEventListener('click', function() { enterPickMode('src'); });
+document.getElementById('btn-pick-dst').addEventListener('click', function() { enterPickMode('dst'); });
+
+// Close modal if overlay background clicked
+document.getElementById('node-modal-overlay').addEventListener('click', function(e) {
+    if (e.target === this) closeModal();
+});
+document.getElementById('eta-dialog-overlay').addEventListener('click', function(e) {
+    if (e.target === this) closeEtaDialog();
+});
+
+/* ── Navigate flow ── */
+let pendingNavigate = null; // {src, dst, carId, eta}
+
+function setStatus(msg, color) {
+    const el = document.getElementById('nav-status');
+    el.textContent = msg;
+    el.style.color = color || '#81c784';
+}
+
+function onNavigate() {
+    const srcVal = document.getElementById('input-src').value.trim();
+    const dstVal = document.getElementById('input-dst').value.trim();
+    const src = parseInt(srcVal, 10);
+    const dst = parseInt(dstVal, 10);
+
+    if (isNaN(src) || isNaN(dst)) {
+        setStatus('Enter valid source and destination node IDs.', '#ef9a9a');
+        return;
+    }
+    if (src === dst) {
+        setStatus('Source and destination must differ.', '#ef9a9a');
+        return;
+    }
+
+    setStatus('Computing route\u2026', '#ffb74d');
+    document.getElementById('btn-navigate').disabled = true;
+
+    fetch('http://localhost:8090/navigate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ src: src, dst: dst }),
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        document.getElementById('btn-navigate').disabled = false;
+        if (data.error) {
+            setStatus('Error: ' + data.error, '#ef9a9a');
+            return;
+        }
+        pendingNavigate = { src: src, dst: dst, carId: data.car_id, eta: data.eta };
+        showEtaDialog(data.car_id, data.eta, src, dst);
+    })
+    .catch(function(err) {
+        document.getElementById('btn-navigate').disabled = false;
+        setStatus('Network error: ' + err, '#ef9a9a');
+    });
+}
+
+function showEtaDialog(carId, eta, src, dst) {
+    const minutes = Math.floor(eta / 60);
+    const seconds = Math.round(eta % 60);
+    const etaStr = minutes > 0 ? minutes + 'm ' + seconds + 's' : seconds + 's';
+    document.getElementById('eta-display').textContent = etaStr;
+    document.getElementById('eta-route-info').textContent =
+        'Node ' + src + ' \u2192 Node ' + dst + ' \u00B7 Car #' + carId;
+    document.getElementById('eta-dialog-overlay').classList.add('open');
+}
+
+function closeEtaDialog() {
+    document.getElementById('eta-dialog-overlay').classList.remove('open');
+    if (pendingNavigate) {
+        // Car is already registered and moving on the server
+        setStatus('Navigation active \u2014 car #' + pendingNavigate.carId, '#4fc3f7');
+        userCarId = pendingNavigate.carId;
+        pendingNavigate = null;
+    }
+}
+
+function confirmNavigate() {
+    document.getElementById('eta-dialog-overlay').classList.remove('open');
+    if (!pendingNavigate) return;
+    userCarId = pendingNavigate.carId;
+    setStatus('Navigating\u2026 car #' + userCarId, '#4fc3f7');
+    // Center on the source node's actual coordinates
+    var srcNode = allNodes.find(function(n) { return n.id === pendingNavigate.src; });
+    if (srcNode) {
+        map.setView([srcNode.lat, srcNode.lon], map.getZoom());
+    }
+    clearPickMarkers();
+    pendingNavigate = null;
+    document.getElementById('btn-navigate').style.display = 'none';
+    document.getElementById('btn-new-trip').style.display = 'block';
+}
+
+function onNewTrip() {
+    // Remove user car marker from map
+    if (userCarMarker) {
+        userCarMarker.remove();
+        userCarMarker = null;
+    }
+    userCarId = null;
+    // Clear inputs
+    document.getElementById('input-src').value = '';
+    document.getElementById('input-dst').value = '';
+    clearPickMarkers();
+    // Swap buttons back
+    document.getElementById('btn-new-trip').style.display = 'none';
+    document.getElementById('btn-navigate').style.display = 'block';
+    setStatus('', '#81c784');
+}
+
 /* ── polling ── */
 initEdgeLayer();       // async one-time fetch of all road geometries
+loadNodes();           // async one-time fetch of all nodes for browse modal
 fetchPositions();
 fetchCongestion();
 fetchMetrics();
