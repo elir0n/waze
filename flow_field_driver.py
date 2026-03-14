@@ -207,7 +207,7 @@ class AreaManager:
         for aid, area in self.areas.items():
             data[f"flow_x_{aid}"]    = area.flow_x
             data[f"flow_y_{aid}"]    = area.flow_y
-            data[f"nodes_{aid}"]     = np.array(area.nodes, dtype=np.int32)
+            data[f"nodes_{aid}"]     = np.array(area.nodes, dtype=np.int64)
             cols = np.array([c for c, r in area.cells], dtype=np.int32)
             rows = np.array([r for c, r in area.cells], dtype=np.int32)
             data[f"cells_col_{aid}"] = cols
