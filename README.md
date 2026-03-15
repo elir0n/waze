@@ -1,58 +1,33 @@
-# Waze — Concurrent Traffic Routing Engine
+# Waze — Technical Report
 
-A high-performance, multithreaded routing server written in **C** with a full Python simulation ecosystem.
-Inspired by real navigation systems: concurrent clients, live A\* routing, EMA-smoothed traffic updates, flow-field batch simulation, and a real-time map visualization — all running on real Tel Aviv street data.
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Screenshots](#screenshots)
-- [Architecture](#architecture)
-- [Docker (quickest start)](#docker-quickest-start)
-- [Getting Started](#getting-started)
-- [Graph Data](#graph-data)
-- [Protocol](#protocol)
-- [Simulations](#simulations)
-- [Flow-Field Batch Driver](#flow-field-batch-driver)
-- [Live Map Visualization](#live-map-visualization)
-- [Load Testing](#load-testing)
-- [Project Structure](#project-structure)
-- [Authors](#authors)
+Course: Parallel & Distributed Programming
 
 ---
 
-## Overview
+## 1. System Architecture
 
-This project implements the core of a navigation system from scratch:
+The system is split into three communicating services:
 
-| Layer | Technology | What it does |
+```
+[Simulated Clients]
+      │  TCP (port 8080, JSON)
+      ▼
+[Graph & Routing Service]  ←──►  [Traffic Ingestion Service]
+      │                                    │
+      └──────────── shared graph (rwlock) ──┘
+```
+
+### Components
+
+| Service | Implementation | Responsibility |
 |---|---|---|
-| **Routing server** | C, pthreads | Concurrent TCP server, A\* pathfinding, live traffic |
-| **Vehicle simulation** | Python (ThreadPoolExecutor) | Thousands of cars requesting routes, sending speed reports |
-| **Flow-field engine** | Python, NumPy | Pre-computed Dijkstra wavefronts for massively parallel routing |
-| **Live visualization** | Leaflet.js, Python HTTP bridge | Real-time map of car positions and road congestion |
-| **Real-world graph** | OSM / osmnx | Actual Tel Aviv street network with geometry and speeds |
+| **Graph & Routing Service** | C (`src/server.c`, `src/routing.c`) | Stores the road graph, answers route requests via A\*, exposes TCP endpoint |
+| **Traffic Ingestion Service** | C (`src/server.c`) | Receives speed reports from cars, applies EMA to edge travel times |
+| **Simulated Clients** | Python (`legacy/car_client.py`) | Cars that request routes, follow them, and send periodic traffic reports |
+| **HTTP Bridge** | Python (`gui/bridge.py`) | Translates TCP server state into REST endpoints for the browser |
+| **GUI** | Leaflet.js (`gui/map.html`) | Live map showing car positions, road congestion, and real-time metrics |
 
-### What makes it interesting
-
-- **Three-tier concurrency**: accept thread → per-client threads → read/write worker pools. Routing queries run in parallel under a reader lock; traffic updates serialize under a writer lock.
-- **Live A\* routing**: the A\* heuristic uses actual lat/lon coordinates. Edge weights reflect real-time EMA-smoothed travel times from speed reports.
-- **Congestion model**: road capacity is modeled per lane. As occupancy rises, speed degrades linearly — down to a minimum of 10% (JAM_SPEED_FACTOR) to prevent full gridlock.
-- **Flow-field routing**: for large-scale simulations, the map is divided into geographic sectors. A one-time Dijkstra wavefront per sector pre-computes a flow field pointing every cell toward that sector. Cars at scale follow flow vectors instead of running individual A\* searches.
-- **Adaptive rerouting**: the batch driver monitors edge congestion every 10 ticks and re-routes cars that have jammed segments ahead.
-
----
-
-## Screenshots
-
-<!-- Add map screenshots here -->
-> _Live map screenshots coming soon._
-
----
-
-## Architecture
+All services communicate over **TCP on port 8080** (line-based, JSON payloads). The HTTP bridge additionally exposes **port 8090** for the browser.
 
 ### Concurrency Model
 
@@ -62,349 +37,176 @@ TCP client  ──►  client_thread  ──►  routing_q  ──►  ROUTE_WOR
 TCP client  ──►  client_thread  ──►  traffic_q  ──►  TRAFFIC_WORKERS (2) ─┘
 ```
 
-1. **Accept thread** — accepts connections, spawns a detached client thread per socket.
-2. **Client threads** — parse one request at a time, create a `Task`, push it to the appropriate queue, then **block on a condition variable** until a worker signals completion. This guarantees ordered responses per connection.
-3. **Worker pools** — two pools share one `pthread_rwlock_t` over the graph:
-   - Routing workers hold a **read lock** (multiple can run in parallel).
-   - Traffic workers hold a **write lock** (exclusive, serialized).
+1. **Accept thread** — accepts TCP connections, spawns a detached client thread per socket.
+2. **Client threads** — parse one request at a time, push a `Task` to the appropriate queue, then block on a condition variable until a worker signals completion. This guarantees ordered responses per connection.
+3. **Routing worker pool** (`ROUTE_WORKERS = 8`) — threads hold a **read lock** on the graph; multiple routing queries execute in parallel.
+4. **Traffic worker pool** (`TRAFFIC_WORKERS = 2`) — threads hold a **write lock** on the graph; traffic updates are serialized to prevent race conditions on edge weights.
+
+---
+
+## 2. Data Structures
 
 ### Graph
 
 ```
 Graph
- ├── nodes[MAX_NODES = 100 000]    fixed array
- │    └── Node { node_id, lat, lon, out_edges → [EdgeNode] }
+ ├── nodes[MAX_NODES = 100 000]    fixed-size array
+ │    └── Node { node_id, lat, lon, out_edges → [EdgeNode] }   (adjacency list)
  └── edges[]                       dynamic array
-      └── Edge { from, to, base_length, base_speed_limit,
-                 current_travel_time, ema_travel_time, observation_count,
+      └── Edge { edge_id, from_node, to_node,
+                 base_length, base_speed_limit,
+                 current_travel_time,
+                 ema_travel_time, observation_count,
                  road_type, lanes, is_oneway }
 ```
 
-- Node coordinates are used for the **admissible A\* heuristic** (equirectangular distance ÷ max graph speed).
-- Travel times are initialized from `base_length / base_speed_limit` and updated live via EMA.
+**Adjacency list** (not a matrix): for each node, a linked list of outgoing edge IDs. This is efficient for sparse road graphs where the average node has only 2–4 neighbours.
+
+Node `lat`/`lon` coordinates are stored for the A\* heuristic and for drawing.
+
+`ema_travel_time` and `observation_count` serve as historical statistics: they accumulate past measurements and are used by the prediction endpoint.
+
+### Car (Vehicle State)
+
+```
+VehicleState {
+    car_id, user_id
+    route_edges[]        // list of edge IDs for the current route
+    edge_idx             // index into route_edges (current position)
+    pos                  // position along current edge, 0.0–1.0
+    speed                // current speed (km/h), computed from congestion
+    state                // CAR_IDLE | CAR_DRIVING | CAR_ARRIVED
+}
+```
+
+Cars are stored server-side in a fixed registry (`MAX_CARS = 30 000`). Each car advances in discrete time steps (`TICK_ALL dt`), sends speed reports back to the Traffic Ingestion Service, and requests a new route when it arrives.
+
+---
+
+## 3. Algorithms
 
 ### A\* Routing
 
-`routing.c` implements A\* over the directed graph using a **binary min-heap** (`min_heap.c`) as the open set.
-The heap tracks node positions with a position array for O(log N) `decreaseKey`. The function returns the edge-ID path, the node-ID path, and total estimated travel time.
+`routing.c` implements A\* over the directed graph using a **binary min-heap** with `decreaseKey` for O(log N) updates.
 
-### Traffic EMA
+**Edge weight**: `w(e) = current_travel_time(e)` — the EMA-smoothed travel time, updated live by the Traffic Ingestion Service.
+
+**Heuristic**: equirectangular distance from node `n` to the goal, divided by the maximum speed in the graph:
+
+```
+h(n) = geo_distance(n, goal) / v_max
+```
+
+This is **admissible** (never overestimates), so A\* is guaranteed to find the optimal path.
+
+**Why A\* over Dijkstra**: on a geographic road network the heuristic eliminates most of the search space, giving significantly faster queries — especially important for handling many concurrent requests.
+
+### Traffic EMA (Exponential Moving Average)
 
 When a car reports its speed on an edge:
 
 ```
-measured = base_length / reported_speed
-alpha    = 1.0   (first observation)
-alpha    = 0.2   (subsequent observations)
-ema      = alpha * measured + (1 - alpha) * ema
+T_measured = base_length / reported_speed
+alpha      = 1.0   (first observation)
+alpha      = 0.2   (subsequent observations)
+T_ema      = alpha * T_measured + (1 - alpha) * T_ema
 ```
 
-A 20% weight on new observations smooths out noise while still reacting to sustained changes.
+A 20% weight on new observations smooths noise while still reacting quickly to sustained congestion. The updated `T_ema` is written back to `current_travel_time`, so the next A\* query immediately uses the new weight.
+
+### Traffic Prediction Heuristic
+
+The `PRED <edge_id>` command returns the EMA-smoothed travel time as the predicted near-future travel time. For edges with no observations yet, it falls back to `base_length / base_speed_limit`. This is a rule-based heuristic: the EMA of past observations is used directly as the prediction.
 
 ### Vehicle Physics
 
-Cars are tracked server-side with `{edge_index, position [0–1]}`. On each tick:
+On each `TICK_ALL dt`:
 
 ```
-speed   = base_speed × congestion_factor
-advance = (speed × dt) / edge_length
-```
-
-If `position ≥ 1.0`, the car moves to the next edge and the remaining time propagates recursively — so one tick can cross multiple short edges cleanly.
-
-**Congestion factor**:
-```
-occupancy       = cars currently on edge
-capacity        = lanes × CARS_PER_LANE (5)
-cong_factor     = max(0.1, 1.0 − occupancy / capacity)
+occupancy    = cars currently on edge
+capacity     = lanes × CARS_PER_LANE (5)
+cong_factor  = max(0.1, 1.0 − occupancy / capacity)
+speed        = base_speed × cong_factor
+advance      = (speed × dt) / edge_length
 ```
 
 `TICK_ALL` pre-computes a single occupancy array for all edges before advancing any car — O(N) instead of O(N²).
 
 ---
 
-## Docker (quickest start)
+## 4. Build and Run
+
+### Step 1 — Download the Tel Aviv map
+
+Requires Python with `osmnx` installed (`pip install osmnx`):
+
+```bash
+python3 scripts/download_tel_aviv.py --out data/
+```
+
+This downloads the Tel Aviv drive network from OpenStreetMap and writes `data/nodes.csv`, `data/edges.csv`, and `data/graph.meta`. One-time download (~1–2 min).
+
+### Step 2 — Run with Docker
+
+```bash
+docker compose bulid
+```
 
 ```bash
 docker compose up
 ```
 
-That's it. On first run the container downloads the Tel Aviv street network from OpenStreetMap (~1–2 min, one-time), builds the flow-field cache (~30 s, one-time), then starts 500 simulated cars.
+Builds the C server, starts 500 simulated cars, and exposes the live map at **http://localhost:8090/map.html**.
 
-Open **http://localhost:8090/map.html** to see cars moving in real time. Subsequent `docker compose up` calls start instantly from the cached data.
-
-```bash
-# Reset all cached data (forces fresh OSM download + flow-field rebuild)
-docker compose down -v
-```
-
-### Simulation modes
-
-| Mode | Command | Cars | Routing |
-|---|---|---|---|
-| **Flow-field** (default) | `docker compose up` | 500+ | Pre-computed sector flow fields; one `TICK_ALL` per tick |
-| **Car simulation** | `docker compose --profile car-sim up --scale flow-sim=0` | ~10–100 | Per-car A\* via individual TCP calls |
-
-The flow-field mode scales much better and is the recommended default. The car simulation mode gives finer per-car control and is useful for debugging or interactive routing.
+> If `data/` already contains the graph files from Step 1, the container skips the download and starts immediately.
 
 ---
 
-## Getting Started
+## 5. User Navigation
 
-### 1. Build the server
+The live map includes an interactive navigation panel that lets you plan and follow a route alongside the simulated traffic.
 
-```bash
-make          # compile
-make run      # compile and start (port 8080)
-make clean    # remove binary
-```
+### Selecting Source & Destination
 
-Compiler: `gcc -Wall -Wextra -std=c11 -O2 -lm -pthread`
+Pick origin and destination nodes using **Browse list** (searchable node list) or **Click map** (click directly on the map to snap to the nearest node). Selected nodes are marked with a red dot on the map.
 
-Override worker pool sizes at compile time:
-```bash
-make CFLAGS="-Wall -Wextra -std=c11 -O2 -DROUTE_WORKERS=16 -DTRAFFIC_WORKERS=4"
-```
+![Navigation panel with source selected](screenshots/pick_source.png)
 
-### 2. Generate graph data
+![Both source and destination selected](screenshots/pick_destination.png)
 
-```bash
-# Synthetic graph (fast, good for testing)
-python3 generate_graph.py --nodes 1000 --edges 3000
+### Route & ETA Confirmation
 
-# Real-world Tel Aviv graph from a .graphml file (via osmnx)
-python3 scripts/convert_graph.py <file.graphml>
-```
+After clicking **Navigate**, the server computes the optimal A\* route and displays the estimated travel time. Click **Start Journey** to begin, or **Cancel** to go back.
 
-The server requires `data/graph.meta`, `data/nodes.csv`, `data/edges.csv` before starting. The `data/` directory is gitignored.
+![ETA confirmation dialog](screenshots/eta_dialog.png)
 
-### 3. Run a simulation
+### Following Your Car
 
-```bash
-# Terminal 1
-./server
+Once the journey starts, your car appears as a pulsing icon on the map. The map centers on the source node and tracks your car in real time among the simulated traffic. When you arrive, a status message confirms it.
 
-# Terminal 2 — 20 cars, 200 steps, 8 parallel threads
-python3 car_client.py --mode sim --cars 20 --steps 200 --sim-workers 8
+Click **New Trip** to reset and plan another route.
 
-# Or: interactive routing REPL
-python3 car_client.py --mode interactive
-```
-
-### 4. Flow-field simulation with live map
-
-```bash
-# Terminal 1
-./server
-
-# Terminal 2 — 500 cars, 3×3 sector grid
-python3 flow_field_driver.py --cars 500 --data-dir data --nx 3 --ny 3
-# Flow fields are computed once and cached; subsequent runs start instantly.
-
-# Terminal 3 (optional) — desktop map viewer
-python3 gui/gui.py
-# Or open http://localhost:8090/map.html in a browser
-```
+![Live map overview](screenshots/nav_panel.png)
 
 ---
 
-## Graph Data
+## 6. Experiments
 
-### `data/graph.meta`
-```
-num_nodes <N>
-num_edges <M>
-```
+### 6.1 Effect of Threading on Routing Throughput
 
-### `data/nodes.csv`
-```
-node_id,lat,lon
-```
+**Setup**: 2000-node / 6000-edge graph; 32 concurrent clients each sending 50 routing requests (1600 total). Server compiled with varying `ROUTE_WORKERS`.
 
-### `data/edges.csv`
-```
-edge_id,from_node,to_node,base_length,base_speed_limit,road_type,lanes,is_oneway
-```
+| Route Workers | Throughput (ops/s) | Elapsed (s) | p50 latency (ms) | p99 latency (ms) |
+|:---:|---:|---:|---:|---:|
+| 1 | 202 | 7.90 | 138 | 378 |
+| 2 | 393 | 4.08 | 78 | 123 |
+| 4 | 322 | 4.98 | 55 | 281 |
+| 8 | 148 | 10.80 | 220 | 405 |
 
-The graph is directed. The loader handles large OSM node IDs (> INT\_MAX) via a two-pass remapping: first pass builds a sorted `raw_id → sequential_index` table, second pass binary-searches it during edge loading.
-
----
-
-## Protocol
-
-Line-based TCP. JSON is the primary format; `PRED`, `POSITIONS`, `CONGESTION`, and `TICK_ALL` use plain text.
-
-### Routing request
-```json
-{"user_id": 1, "car_id": 1, "start_node": 10, "destination_node": 42, "timestamp": 0.0}
-```
-```json
-{"user_id": 1, "car_id": 1, "route_edges": [100, 233, 912], "eta": 47.31}
-```
-```json
-{"error": "NO_ROUTE", "user_id": 1, "car_id": 1}
-```
-
-### Traffic update
-```json
-{"user_id": 1, "car_id": 1, "edge_id": 233, "speed": 16.2, "position_on_edge": 0.45, "timestamp": 13.0}
-```
-```json
-{"status": "ACK", "user_id": 1, "car_id": 1}
-```
-
-### Vehicle management
-```json
-{"register_car": 1, "user_id": 1, "car_id": 1, "start_node": 0, "destination_node": 99}
-{"tick_car": 1, "car_id": 1, "dt": 1.0}
-{"register_route": 1, "car_id": 1, "start_node": 0, "dest_node": 99, "route_edges": [0, 5, 7]}
-```
-
-### Bulk queries (plain text)
-```
-POSITIONS          → JSON array of {car_id, lat, lon, state}
-CONGESTION         → JSON array of {edge_id, occupancy, capacity, ...}
-TICK_ALL 1.0       → advances all registered cars by 1 second
-PRED <edge_id>     → PRED <edge_id> <predicted_travel_time>
-```
-
-Manual testing:
-```bash
-nc 127.0.0.1 8080
-```
-
----
-
-## Simulations
-
-### `car_client.py` — car simulation + interactive REPL
-
-**Simulation mode** (`--mode sim`):
-- Each car runs in a thread: `register_car` → loop of `tick_car` until arrived → repeat
-- Cars send periodic speed reports back to the server, feeding EMA traffic updates
-- Prints a summary at the end: state breakdown, average trip length
-
-**Interactive mode** (`--mode interactive`):
-- Type routes manually; get back edge lists and ETAs
-- `pred <edge_id>` queries the traffic prediction for any edge
-
-```bash
-python3 car_client.py --mode sim --cars 50 --steps 500 --dt 2.0 --sim-workers 16
-python3 car_client.py --mode interactive
-```
-
----
-
-## Flow-Field Batch Driver
-
-`flow_field_driver.py` is an alternative large-scale simulation that separates routing into two phases:
-
-### Phase 1 — Pre-computation (run once, cached as `.npz`)
-
-1. **Grid** (`flow_field/grid.py`): rasterize the road network onto a uniform 2D grid (~100m cells) using Bresenham's line algorithm. Each cell stores a traversal cost derived from road type, speed, and lanes.
-
-   Road type cost factors: `motorway = 1.0`, `primary = 0.7`, `residential = 0.4`, `service = 0.25`
-
-2. **Integration field** (`flow_field/fields.py`): run multi-source Dijkstra outward from all destination cells. Every cell records its minimum-cost distance to the destination. O(N log N).
-
-3. **Flow field** (`flow_field/fields.py`): vectorized NumPy pass — for each cell, find the steepest-descent neighbor among 8 directions and store a unit-length (vx, vy) vector. No Python loops.
-
-### Phase 2 — Simulation loop
-
-- The map is divided into NX×NY geographic sectors. Each sector has its own cached flow field.
-- Cars pick a destination sector, use `pick_destination()` to find a node in that sector, A\* route to it, and register the route with the C server.
-- Main loop calls `TICK_ALL` every iteration. Arrived cars dwell (5–15 s), then get a new destination.
-- Every 10 ticks: query `CONGESTION`, evict cached A\* routes through jammed edges, reroute affected cars.
-
-**Agent movement** (`flow_field/agents.py`):
-- Near destination (within last-mile radius): direct unit vector to goal node
-- Far from destination: bilinear interpolation of flow field at continuous (col, row)
-- Separation forces via spatial hash (3×3 bucket search) prevent clustering
-
-```bash
-python3 flow_field_driver.py --cars 500 --data-dir data --nx 3 --ny 3
-# First run builds flow fields (~1–2 min). Subsequent runs load cache and start instantly.
-```
-
----
-
-## Live Map Visualization
-
-### HTTP Bridge (`gui/bridge.py`)
-
-The C server speaks TCP; the browser needs HTTP. `bridge.py` runs two things in parallel:
-- **Polling thread**: queries `POSITIONS` and `CONGESTION` from the server every 500ms, caches results.
-- **HTTP server** (port 8090): serves `/positions`, `/congestion`, `/metrics`, and the static `map.html`.
-
-### Map (`gui/map.html`)
-
-Built with Leaflet.js on OpenStreetMap tiles.
-
-- **Car markers**: colored by state — driving (blue), arrived (green), idle (orange)
-- **Congestion overlay**: road segments colored by occupancy — orange (< 50% capacity), red (> 80%)
-- **Live metrics panel**: driving / arrived / idle / total counts, updated every 500ms
-
-### Desktop launcher (`gui/gui.py`)
-
-Wraps `map.html` in a PySide6 QWebEngineView window. Falls back to Chrome (for WSL) or the system browser.
-
-```bash
-python3 gui/gui.py
-# or just open http://localhost:8090/map.html
-```
-
----
-
-## Load Testing
-
-`load_test.py` hammers the server with concurrent routing and traffic requests to verify stability under parallel load.
-
-```bash
-python3 load_test.py --num-nodes 1000 --num-edges 3000
-```
-
-Default workload: 32 routing clients × 50 requests + 8 traffic clients × 100 updates, all concurrent.
-Reports: throughput (ops/sec), latency percentiles (p50 / p90 / p99), timeout counts.
-
----
-
-## Project Structure
-
-```
-.
-├── src/
-│   ├── main.c              # Entry point — loads graph, starts server
-│   ├── server.c / .h       # TCP server, worker pools, vehicle simulation (~1340 lines)
-│   ├── graph.c / .h        # Graph struct, heuristic, edge weights
-│   ├── graph_loader.c / .h # CSV parser, OSM ID remapping (two-pass)
-│   ├── routing.c / .h      # A* pathfinding
-│   └── min_heap.c / .h     # Binary min-heap for A* open set
-│
-├── flow_field/
-│   ├── fields.py           # Dijkstra integration field + vectorized flow field
-│   ├── grid.py             # Grid rasterization, cost field, Bresenham
-│   ├── agents.py           # Agent movement, bilinear sampling, spatial hash
-│   └── loader.py           # CSV → Grid pipeline
-│
-├── gui/
-│   ├── bridge.py           # HTTP / TCP bridge (polling + REST endpoints)
-│   ├── gui.py              # Qt desktop launcher
-│   └── map.html            # Leaflet live visualization
-│
-├── scripts/
-│   └── convert_graph.py    # .graphml (osmnx) → CSV converter
-│
-├── data/                   # Graph files — gitignored, generated locally
-│   ├── graph.meta
-│   ├── nodes.csv
-│   └── edges.csv
-│
-├── generate_graph.py       # Synthetic graph generator
-├── car_client.py           # Car simulation + interactive client
-├── flow_field_driver.py    # Multi-area flow-field simulation + HTTP backend
-├── load_test.py            # Concurrent load tester
-└── makefile
-```
+**Observations**:
+- Going from 1 → 2 workers nearly doubles throughput (×1.94), confirming that parallel routing under the reader lock works correctly.
+- Beyond 2 workers the gains diminish and reverse on this small synthetic graph. On a small graph, each A\* query completes in microseconds; the overhead of the task-queue mutex and thread scheduling dominates. On a larger real-world graph (Tel Aviv, ~50 000 nodes), routing queries are more expensive and additional workers would continue to improve throughput.
+- p50 latency with 4 workers (55 ms) is lower than with 2 workers (78 ms), suggesting the server handles bursty load better with more threads even when raw throughput is similar.
 
 ---
 
