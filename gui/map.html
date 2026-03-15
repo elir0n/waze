@@ -391,6 +391,9 @@ function makeUserCarIcon() {
 }
 
 function updateUserCar(id, lat, lon, state) {
+    // Ignore updates for cars that aren't the current user car
+    if (userCarId !== null && id !== userCarId) return;
+
     if (!userCarMarker) {
         userCarMarker = L.marker([lat, lon], {
             icon: makeUserCarIcon(),
@@ -403,6 +406,8 @@ function updateUserCar(id, lat, lon, state) {
     if (state === 'arrived' && userCarId) {
         setStatus('You have arrived! \u2705', '#81c784');
         userCarMarker.setPopupContent('<b>Your car</b><br>Arrived!').openPopup();
+    } else if (state === 'driving' && userCarId) {
+        userCarMarker.setPopupContent('<b>Your car</b><br>ID: ' + id);
     }
 }
 
