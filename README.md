@@ -1,216 +1,441 @@
-# Waze — Technical Report
+<div align="center">
 
-Course: Parallel & Distributed Programming
+# 🗺️ Waze — Real-Time GPS Navigation & Traffic Simulation
 
----
+[![Language: C](https://img.shields.io/badge/Language-C11-blue?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C11_(C_standard_revision))
+[![Python](https://img.shields.io/badge/Python-3.10+-yellow?logo=python&logoColor=white)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](Dockerfile)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL2-lightgrey?logo=linux&logoColor=white)]()
 
-## 1. System Architecture
+**A production-grade GPS navigation engine** built from scratch in C with Python tooling — featuring concurrent A\* routing, live traffic ingestion, congestion physics, and a real-time web map powered by Tel Aviv's OpenStreetMap road network.
 
-The system is split into three communicating services:
-
-```
-[Simulated Clients]
-      │  TCP (port 8080, JSON)
-      ▼
-[Graph & Routing Service]  ←──►  [Traffic Ingestion Service]
-      │                                    │
-      └──────────── shared graph (rwlock) ──┘
-```
-
-### Components
-
-| Service | Implementation | Responsibility |
-|---|---|---|
-| **Graph & Routing Service** | C (`src/server.c`, `src/routing.c`) | Stores the road graph, answers route requests via A\*, exposes TCP endpoint |
-| **Traffic Ingestion Service** | C (`src/server.c`) | Receives speed reports from cars, applies EMA to edge travel times |
-| **Simulated Clients** | Python (`legacy/car_client.py`) | Cars that request routes, follow them, and send periodic traffic reports |
-| **HTTP Bridge** | Python (`gui/bridge.py`) | Translates TCP server state into REST endpoints for the browser |
-| **GUI** | Leaflet.js (`gui/map.html`) | Live map showing car positions, road congestion, and real-time metrics |
-
-All services communicate over **TCP on port 8080** (line-based, JSON payloads). The HTTP bridge additionally exposes **port 8090** for the browser.
-
-### Concurrency Model
-
-```
-TCP client  ──►  client_thread  ──►  routing_q  ──►  ROUTE_WORKERS (8)  ─┐
-                                                                           ├──► graph (rwlock)
-TCP client  ──►  client_thread  ──►  traffic_q  ──►  TRAFFIC_WORKERS (2) ─┘
-```
-
-1. **Accept thread** — accepts TCP connections, spawns a detached client thread per socket.
-2. **Client threads** — parse one request at a time, push a `Task` to the appropriate queue, then block on a condition variable until a worker signals completion. This guarantees ordered responses per connection.
-3. **Routing worker pool** (`ROUTE_WORKERS = 8`) — threads hold a **read lock** on the graph; multiple routing queries execute in parallel.
-4. **Traffic worker pool** (`TRAFFIC_WORKERS = 2`) — threads hold a **write lock** on the graph; traffic updates are serialized to prevent race conditions on edge weights.
+*Parallel & Distributed Programming — Course Project*
 
 ---
 
-## 2. Data Structures
+</div>
+
+## 📸 Screenshots
+
+<div align="center">
+
+| Select Source | Select Destination |
+|:---:|:---:|
+| ![Pick source](screenshots/pick_source.png) | ![Pick destination](screenshots/pick_destination.png) |
+
+| ETA Confirmation | Live Navigation |
+|:---:|:---:|
+| ![ETA dialog](screenshots/eta_dialog.png) | ![Navigation panel](screenshots/nav_panel.png) |
+
+</div>
+
+---
+
+## 🚀 Quick Start
+
+**Using Docker (recommended — zero setup):**
+
+```bash
+# Build and launch everything (server + 500 simulated cars + web UI)
+docker compose up --build
+
+# Open the live map
+open http://localhost:8090/map.html
+```
+
+> On first run, the container automatically downloads the Tel Aviv road network from OpenStreetMap (~1–2 min). Subsequent runs start immediately from the cached graph.
+
+**Local build:**
+
+```bash
+# 1. Download the Tel Aviv road network (once)
+pip install osmnx
+python3 scripts/download_tel_aviv.py --out data/
+
+# 2. Build and run the C server
+make run          # starts listening on TCP port 8080
+
+# 3. Launch simulation clients
+python3 gui/bridge.py &                    # HTTP bridge on port 8090
+python3 legacy/car_client.py --mode sim --cars 50 --steps 200
+```
+
+---
+
+## ✨ Features
+
+| Feature | Details |
+|---|---|
+| ⚡ **Concurrent A\* routing** | 8 parallel routing workers under a shared read lock |
+| 🔄 **Live traffic ingestion** | EMA-smoothed edge weights updated by car speed reports |
+| 🚗 **30,000 simulated vehicles** | Server-side physics with congestion modeling |
+| 🗺️ **Real-world map** | Tel Aviv OpenStreetMap drive network (~50,000 nodes) |
+| 🌐 **Interactive web UI** | Leaflet.js map with car positions, congestion overlays, route planner |
+| 📡 **Line-based JSON protocol** | Simple TCP API compatible with `nc` / curl |
+| 🐳 **Docker Compose** | One-command deployment of the full simulation stack |
+| 🔮 **Travel time prediction** | EMA-based per-edge prediction endpoint |
+
+---
+
+## 🏗️ Architecture
+
+### System Overview
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                        Web Browser                           │
+│                   Leaflet.js  map.html                       │
+└──────────────────────┬───────────────────────────────────────┘
+                       │  HTTP  (port 8090)
+┌──────────────────────▼───────────────────────────────────────┐
+│                    HTTP Bridge (Python)                       │
+│           bridge.py — REST ↔ TCP translation layer           │
+│   /positions  /congestion  /navigate  /edges  /metrics       │
+└──────────────────────┬───────────────────────────────────────┘
+                       │  TCP  (port 8080, line-based JSON)
+┌──────────────────────▼───────────────────────────────────────┐
+│                  C Routing & Traffic Server                   │
+│                                                              │
+│  Accept Thread                                               │
+│       │  spawns per-connection threads                       │
+│       ▼                                                      │
+│  Client Threads ──► routing_q ──► ROUTE_WORKERS (×8) ──┐    │
+│                                    [read lock on graph]  │   │
+│  Client Threads ──► traffic_q ──► TRAFFIC_WORKERS (×2) ─┤   │
+│                                    [write lock on graph] │   │
+│                                                          ▼   │
+│                                              Graph (rwlock)  │
+│                                             + Vehicle Reg.   │
+└──────────────────────────────────────────────────────────────┘
+                       │  also TCP (port 8080)
+┌──────────────────────▼───────────────────────────────────────┐
+│               Simulated Car Clients (Python)                 │
+│     car_client.py / flow_field_driver.py — 500–1000 cars     │
+│     REGISTER → ROUTE → TICK_ALL → traffic reports → loop     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Three-Tier Concurrency Model
+
+```
+TCP socket
+    │
+    ▼ spawns
+client_thread ──► enqueue Task ──► block on cond_var
+                       │
+                 ┌─────┴─────┐
+                 ▼           ▼
+           routing_q    traffic_q
+                 │           │
+         8 workers   2 workers
+         (rd lock)   (wr lock)
+                 │           │
+                 └─────┬─────┘
+                       ▼
+               Graph (pthread_rwlock_t)
+                       │
+               task_complete()
+                       │
+                       ▼
+               client_thread sends response
+```
+
+1. **Accept thread** — accepts TCP connections; spawns a detached `client_thread_main` per socket.
+2. **Client threads** — parse one request line, create a `Task`, enqueue it, then **block** on the task's condition variable. Guarantees per-connection response ordering with zero busy-waiting.
+3. **Routing workers** (`ROUTE_WORKERS = 8`) — hold a **read lock**; multiple A\* queries execute in parallel.
+4. **Traffic workers** (`TRAFFIC_WORKERS = 2`) — hold a **write lock**; EMA updates are serialized to prevent data races on edge weights.
+
+---
+
+## 📁 Project Structure
+
+```
+waze/
+├── src/                          # C — routing engine & TCP server
+│   ├── main.c                    #   Entry point: load graph, start server
+│   ├── server.h / server.c       #   Thread pools, vehicle registry, task dispatch
+│   ├── routing.h / routing.c     #   A* pathfinding over directed graph
+│   ├── min_heap.h / min_heap.c   #   Binary min-heap (A* open set)
+│   ├── graph.h / graph.c         #   Graph data structures & edge weights
+│   └── graph_loader.h / graph_loader.c   # CSV graph parser
+│
+├── gui/                          # Interactive web frontend
+│   ├── map.html                  #   Leaflet.js live map (positions, congestion, routing)
+│   ├── bridge.py                 #   HTTP↔TCP bridge with background polling thread
+│   └── gui.py                    #   Desktop launcher (PySide6 / Chrome / browser fallback)
+│
+├── flow_field/                   # Sector-based flow field simulation
+│   ├── fields.py                 #   Flow field computation per sector
+│   ├── grid.py                   #   2D grid partitioning of the map
+│   └── loader.py                 #   Cached flow field loader
+│
+├── scripts/                      # Data utilities
+│   ├── download_tel_aviv.py      #   OSMnx downloader → nodes.csv / edges.csv
+│   └── convert_graph.py          #   GraphML → CSV converter
+│
+├── legacy/                       # Earlier simulation clients
+│   ├── car_client.py             #   Multi-car TCP simulation (sim / interactive modes)
+│   ├── load_test.py              #   Throughput benchmarking tool
+│   └── agents.py                 #   Agent-based car framework
+│
+├── generate_graph.py             # Synthetic graph generator (for testing)
+├── flow_field_driver.py          # Flow-field simulation entry point
+│
+├── Dockerfile                    # Multi-stage build (gcc → Python slim)
+├── docker-compose.yml            # Orchestration: server + sim + bridge
+├── entrypoint.sh                 # Auto-download graph if missing, then boot server
+├── makefile                      # C build rules
+│
+├── screenshots/                  # UI screenshots
+│   ├── pick_source.png
+│   ├── pick_destination.png
+│   ├── eta_dialog.png
+│   └── nav_panel.png
+│
+└── data/                         # Graph data (gitignored — generated at runtime)
+    ├── graph.meta                #   Node and edge counts
+    ├── nodes.csv                 #   node_id, lat, lon
+    └── edges.csv                 #   edge_id, from, to, length, speed, type, lanes, oneway
+```
+
+---
+
+## 🧠 Data Structures
 
 ### Graph
 
 ```
 Graph
- ├── nodes[MAX_NODES = 100 000]    fixed-size array
- │    └── Node { node_id, lat, lon, out_edges → [EdgeNode] }   (adjacency list)
- └── edges[]                       dynamic array
-      └── Edge { edge_id, from_node, to_node,
-                 base_length, base_speed_limit,
-                 current_travel_time,
-                 ema_travel_time, observation_count,
-                 road_type, lanes, is_oneway }
+ ├── nodes[MAX_NODES = 100,000]     fixed-size array, O(1) lookup
+ │    └── Node
+ │         ├── node_id (int64)
+ │         ├── lat, lon (double)
+ │         └── out_edges → linked list of EdgeNode (adjacency list)
+ │
+ └── edges[]                        dynamic array, O(1) by edge_id
+      └── Edge
+           ├── edge_id, from_node, to_node
+           ├── base_length (m), base_speed_limit (km/h)
+           ├── current_travel_time (s)      ← used by A*
+           ├── ema_travel_time (s)          ← smoothed history
+           ├── observation_count
+           ├── road_type, lanes, is_oneway
+           └── capacity                     ← lanes × ⌊length / headway⌋
 ```
 
-**Adjacency list** (not a matrix): for each node, a linked list of outgoing edge IDs. This is efficient for sparse road graphs where the average node has only 2–4 neighbours.
+Adjacency list (not matrix) — optimal for sparse road graphs where average out-degree ≈ 2–4.
 
-Node `lat`/`lon` coordinates are stored for the A\* heuristic and for drawing.
-
-`ema_travel_time` and `observation_count` serve as historical statistics: they accumulate past measurements and are used by the prediction endpoint.
-
-### Car (Vehicle State)
+### Vehicle State
 
 ```
-VehicleState {
-    car_id, user_id
-    route_edges[]        // list of edge IDs for the current route
-    edge_idx             // index into route_edges (current position)
-    pos                  // position along current edge, 0.0–1.0
-    speed                // current speed (km/h), computed from congestion
-    state                // CAR_IDLE | CAR_DRIVING | CAR_ARRIVED
-}
+VehicleState
+ ├── car_id, user_id
+ ├── route_edges[]        list of edge IDs for current route
+ ├── edge_idx             current position in route
+ ├── pos (0.0–1.0)        fractional position along current edge
+ ├── speed (km/h)         recomputed each tick from congestion
+ └── state                CAR_IDLE | CAR_DRIVING | CAR_ARRIVED
 ```
 
-Cars are stored server-side in a fixed registry (`MAX_CARS = 30 000`). Each car advances in discrete time steps (`TICK_ALL dt`), sends speed reports back to the Traffic Ingestion Service, and requests a new route when it arrives.
+Up to **30,000 vehicles** stored server-side. `TICK_ALL` pre-computes the occupancy array once before advancing any car — O(E) not O(V²).
 
 ---
 
-## 3. Algorithms
+## ⚙️ Algorithms
 
 ### A\* Routing
 
-`routing.c` implements A\* over the directed graph using a **binary min-heap** with `decreaseKey` for O(log N) updates.
+`routing.c` implements A\* with a **binary min-heap** supporting O(log N) decrease-key.
 
-**Edge weight**: `w(e) = current_travel_time(e)` — the EMA-smoothed travel time, updated live by the Traffic Ingestion Service.
+| Component | Detail |
+|---|---|
+| **Edge weight** | `w(e) = current_travel_time(e)` — live EMA-smoothed travel time |
+| **Heuristic** | `h(n) = geo_distance(n, goal) / v_max` — equirectangular, admissible |
+| **Complexity** | O((V + E) log V) |
+| **vs Dijkstra** | Heuristic prunes most of the search space; critical for concurrent load |
 
-**Heuristic**: equirectangular distance from node `n` to the goal, divided by the maximum speed in the graph:
-
-```
-h(n) = geo_distance(n, goal) / v_max
-```
-
-This is **admissible** (never overestimates), so A\* is guaranteed to find the optimal path.
-
-**Why A\* over Dijkstra**: on a geographic road network the heuristic eliminates most of the search space, giving significantly faster queries — especially important for handling many concurrent requests.
+Path reconstruction follows parent pointers back from the goal, returning both the **edge-ID path** (for traffic reports) and **node-ID path** (for display).
 
 ### Traffic EMA (Exponential Moving Average)
 
 When a car reports its speed on an edge:
 
 ```
-T_measured = base_length / reported_speed
-alpha      = 1.0   (first observation)
-alpha      = 0.2   (subsequent observations)
-T_ema      = alpha * T_measured + (1 - alpha) * T_ema
+T_measured  =  base_length / reported_speed
+
+alpha  =  1.0    (first observation — bootstrap immediately)
+alpha  =  0.2    (subsequent — smooth noise, react to trends)
+
+T_ema  =  alpha × T_measured  +  (1 − alpha) × T_ema
+
+current_travel_time  ←  T_ema   (next A* query uses this)
 ```
 
-A 20% weight on new observations smooths noise while still reacting quickly to sustained congestion. The updated `T_ema` is written back to `current_travel_time`, so the next A\* query immediately uses the new weight.
+20% weight on new observations: reacts quickly to sustained congestion while filtering transient spikes.
 
-### Traffic Prediction Heuristic
-
-The `PRED <edge_id>` command returns the EMA-smoothed travel time as the predicted near-future travel time. For edges with no observations yet, it falls back to `base_length / base_speed_limit`. This is a rule-based heuristic: the EMA of past observations is used directly as the prediction.
-
-### Vehicle Physics
+### Congestion Physics
 
 On each `TICK_ALL dt`:
 
 ```
-occupancy    = cars currently on edge
-capacity     = lanes × CARS_PER_LANE (5)
-cong_factor  = max(0.1, 1.0 − occupancy / capacity)
-speed        = base_speed × cong_factor
-advance      = (speed × dt) / edge_length
-```
+capacity     =  lanes × ⌊edge_length / headway(road_class)⌋
 
-`TICK_ALL` pre-computes a single occupancy array for all edges before advancing any car — O(N) instead of O(N²).
+  road class headways:
+    motorway / trunk      →  25 m/car
+    primary / secondary   →  15 m/car
+    residential / other   →   8 m/car
+
+occupancy    =  cars currently on edge  (O(E) pre-pass)
+cong_factor  =  max(jam_floor, 1.0 − occupancy / capacity)
+speed        =  base_speed × cong_factor
+advance      =  (speed × dt) / edge_length
+```
 
 ---
 
-## 4. Build and Run
+## 📡 Protocol
 
-### Step 1 — Download the Tel Aviv map
+Line-based TCP on port **8080**. Each message is a single newline-terminated JSON object (or legacy plain-text for a few commands).
 
-Requires Python with `osmnx` installed (`pip install osmnx`):
+### Requests
+
+| Task | Key fields | Description |
+|---|---|---|
+| Route request | `start_node`, `destination_node` | Compute optimal A\* path |
+| Traffic update | `edge_id`, `speed`, `position_on_edge` | Report car speed → update EMA |
+| Register car | `register_car: 1`, `start_node`, `destination_node` | Server allocates car + computes route |
+| Tick car | `tick_car: 1`, `car_id`, `dt` | Advance single car by `dt` seconds |
+| `TICK_ALL <dt>` | plain text | Advance all cars efficiently (O(E) occupancy pass) |
+| `POSITIONS` | plain text | Fetch all car positions |
+| `CONGESTION` | plain text | Fetch edges with occupancy > 30% capacity |
+| `PRED <edge_id>` | plain text | Predict travel time for an edge |
+
+### Responses
+
+```jsonc
+// Route response
+{"user_id": 1, "car_id": 42, "route_edges": [101, 205, 88, ...], "eta": 347.5}
+
+// Positions response
+{"positions": [{"car_id": 42, "lat": 32.07, "lon": 34.78, "state": "driving"}, ...]}
+
+// Congestion response
+{"congestion": [{"edge_id": 101, "occupancy": 12, "capacity": 8}, ...]}
+
+// ACK / error
+{"status": "ACK", "user_id": 1, "car_id": 42}
+{"error": "NO_PATH"}
+```
+
+---
+
+## 🔨 Build & Configuration
+
+### Building the Server
 
 ```bash
+make              # build ./server
+make run          # build + run
+make clean        # remove binary
+
+# Override worker counts at compile time
+make CFLAGS="-Wall -Wextra -std=c11 -O2 -DROUTE_WORKERS=16 -DTRAFFIC_WORKERS=4"
+```
+
+Compiler: `gcc -Wall -Wextra -std=c11 -O2`, linked with `-lm -pthread`.
+
+### Generating Graph Data
+
+```bash
+# Real Tel Aviv network (~50,000 nodes) — recommended
+pip install osmnx
 python3 scripts/download_tel_aviv.py --out data/
+
+# Synthetic graph (fast, for testing)
+python3 generate_graph.py --nodes 1000 --edges 3000 --out data/
 ```
 
-This downloads the Tel Aviv drive network from OpenStreetMap and writes `data/nodes.csv`, `data/edges.csv`, and `data/graph.meta`. One-time download (~1–2 min).
-
-### Step 2 — Run with Docker
+### Manual Testing
 
 ```bash
-docker compose bulid
+# Raw TCP with netcat
+nc 127.0.0.1 8080
+{"start_node": 0, "destination_node": 999, "user_id": 1, "car_id": 1, "timestamp": 0}
+
+# Simulation clients
+python3 legacy/car_client.py --mode sim --cars 20 --steps 200 --sim-workers 8
+python3 legacy/car_client.py --mode interactive
+
+# Load test
+python3 legacy/load_test.py --num-nodes 2000 --num-edges 6000
 ```
-
-```bash
-docker compose up
-```
-
-Builds the C server, starts 500 simulated cars, and exposes the live map at **http://localhost:8090/map.html**.
-
-> If `data/` already contains the graph files from Step 1, the container skips the download and starts immediately.
 
 ---
 
-## 5. User Navigation
+## 📊 Performance Benchmarks
 
-The live map includes an interactive navigation panel that lets you plan and follow a route alongside the simulated traffic.
-
-### Selecting Source & Destination
-
-Pick origin and destination nodes using **Browse list** (searchable node list) or **Click map** (click directly on the map to snap to the nearest node). Selected nodes are marked with a red dot on the map.
-
-![Navigation panel with source selected](screenshots/pick_source.png)
-
-![Both source and destination selected](screenshots/pick_destination.png)
-
-### Route & ETA Confirmation
-
-After clicking **Navigate**, the server computes the optimal A\* route and displays the estimated travel time. Click **Start Journey** to begin, or **Cancel** to go back.
-
-![ETA confirmation dialog](screenshots/eta_dialog.png)
-
-### Following Your Car
-
-Once the journey starts, your car appears as a pulsing icon on the map. The map centers on the source node and tracks your car in real time among the simulated traffic. When you arrive, a status message confirms it.
-
-Click **New Trip** to reset and plan another route.
-
-![Live map overview](screenshots/nav_panel.png)
-
----
-
-## 6. Experiments
-
-### 6.1 Effect of Threading on Routing Throughput
-
-**Setup**: 2000-node / 6000-edge graph; 32 concurrent clients each sending 50 routing requests (1600 total). Server compiled with varying `ROUTE_WORKERS`.
+**Setup**: 2000-node / 6000-edge synthetic graph; 32 concurrent clients × 50 routing requests = 1,600 total queries.
 
 | Route Workers | Throughput (ops/s) | Elapsed (s) | p50 latency (ms) | p99 latency (ms) |
 |:---:|---:|---:|---:|---:|
 | 1 | 202 | 7.90 | 138 | 378 |
-| 2 | 393 | 4.08 | 78 | 123 |
-| 4 | 322 | 4.98 | 55 | 281 |
+| 2 | **393** | **4.08** | 78 | 123 |
+| 4 | 322 | 4.98 | **55** | 281 |
 | 8 | 148 | 10.80 | 220 | 405 |
 
-**Observations**:
-- Going from 1 → 2 workers nearly doubles throughput (×1.94), confirming that parallel routing under the reader lock works correctly.
-- Beyond 2 workers the gains diminish and reverse on this small synthetic graph. On a small graph, each A\* query completes in microseconds; the overhead of the task-queue mutex and thread scheduling dominates. On a larger real-world graph (Tel Aviv, ~50 000 nodes), routing queries are more expensive and additional workers would continue to improve throughput.
-- p50 latency with 4 workers (55 ms) is lower than with 2 workers (78 ms), suggesting the server handles bursty load better with more threads even when raw throughput is similar.
+**Key observations:**
+- **1 → 2 workers**: ×1.94 throughput — parallel reads under `pthread_rwlock` work correctly with near-linear scaling.
+- **Beyond 2 workers on small graphs**: diminishing returns. Each A\* query on a 2000-node graph completes in microseconds; task-queue mutex contention and thread scheduling overhead dominate.
+- **p50 latency at 4 workers (55 ms)** is lower than at 2 workers (78 ms) — more threads handle bursty load better even when aggregate throughput is similar.
+- On the real Tel Aviv graph (~50,000 nodes), A\* queries are substantially more expensive and additional workers continue to improve throughput.
 
 ---
 
-## Authors
+## 🐳 Docker Deployment
 
-- **Eliron Picard**
-- **Roy Meiri**
+```yaml
+# docker-compose.yml services
+server:      # C routing daemon — downloads OSM graph on first run
+flow-sim:    # Flow-field simulation with 1000 cars (default)
+bridge:      # HTTP bridge (car-sim profile)
+sim:         # Python car simulation (car-sim profile)
+```
+
+```bash
+# Full stack (server + flow field simulation + web UI)
+docker compose up --build
+
+# With browser-based per-car simulation
+docker compose --profile car-sim up --build
+
+# Just the server (bring your own client)
+docker compose up server
+```
+
+The `data/` volume persists the downloaded graph between restarts.
+
+---
+
+## 🔧 Component Reference
+
+| File | Language | Responsibility |
+|---|---|---|
+| [src/server.c](src/server.c) | C | TCP server, thread pools, vehicle registry, congestion physics |
+| [src/routing.c](src/routing.c) | C | A\* pathfinding with binary min-heap |
+| [src/graph.c](src/graph.c) | C | Graph data structure, edge weights, A\* heuristic |
+| [src/graph_loader.c](src/graph_loader.c) | C | CSV parser for nodes/edges, OSM ID remapping |
+| [src/min_heap.c](src/min_heap.c) | C | Binary min-heap with O(log N) decrease-key |
+| [gui/bridge.py](gui/bridge.py) | Python | HTTP↔TCP bridge, background poller, REST API |
+| [gui/map.html](gui/map.html) | JS/HTML | Leaflet.js live map: positions, congestion, route planner |
+| [flow_field/](flow_field/) | Python | Sector-based flow field computation for large-scale sim |
+| [scripts/download_tel_aviv.py](scripts/download_tel_aviv.py) | Python | OSMnx downloader for real-world graph |
+| [generate_graph.py](generate_graph.py) | Python | Synthetic random graph generator |
+
+---
+
+## 👥 Authors
+
+**Eliron Picard** · **Roy Meiri**
+
+*Parallel & Distributed Programming — 2025*
