@@ -165,6 +165,9 @@ The `pthread_rwlock_t graph_lock` is the central synchronisation point:
 - **TASK_REQ routing workers**: acquire **no lock**. `current_travel_time` is declared
   `_Atomic double` in `graph.h`, so each A* weight read is an atomic load. This means routing
   workers never block each other or the traffic workers.
+- **TASK_PRED routing workers**: acquire a **read lock** to read `ema_travel_time` from the
+  graph. Multiple concurrent predictions are allowed; they block only if a traffic write is
+  in progress.
 - **Segment threads** (Phase 1 + Phase 3 of batch routing): acquire a **read lock**.
 - **Traffic workers** (`TASK_UPD`): acquire a **write lock** to serialise the EMA
   read-modify-write sequence on `ema_travel_time` and `observation_count`. The final write to
@@ -209,17 +212,17 @@ Baseline (1 worker): 82.4 ops/s
 ### Analysis
 
 **Why throughput is flat from 1–8 workers:**
-On a 2,000-node synthetic graph, a single A* call completes in under 1 ms. The 32 concurrent
-clients each send requests **sequentially** (send → wait for response → send next), so the
-bottleneck is the round-trip time between client and server, not the routing computation itself.
-Increasing routing workers does not help when the workers are already idle most of the time
-waiting for the next request to arrive.
+The 32 concurrent clients each send requests **sequentially** (send → wait for response → send
+next), so at most 32 A* calls can be in flight simultaneously. At ~400 ms p50 latency, most of
+that time is queue wait and network round-trip, not the A* computation itself. Routing workers
+are idle a large fraction of the time waiting for the next request to arrive, so adding more
+workers beyond the client count provides no benefit.
 
 **Why throughput drops at 12+ workers:**
 Each additional thread adds OS scheduling overhead and increases contention on the task queue
-mutex (`routing_q.mu`), the per-connection `recv` calls, and the read-write lock. On a
-2,000-node graph, the overhead from spawning and managing extra threads dominates the time
-saved by running A* in parallel.
+mutex (`routing_q.mu`), the per-connection `recv` calls, and the read-write lock. Once the
+worker count exceeds the natural parallelism of the workload (32 sequential clients), the cost
+of managing extra idle threads dominates any gain from additional routing capacity.
 
 **Where parallelism does help:**
 
@@ -229,18 +232,18 @@ saved by running A* in parallel.
 
 2. **Within-group Phase 1 + Phase 3 parallelism:** When a batch of N cars is submitted, the
    `handle_batch_section` function spawns 2N threads (N for Phase 1, N for Phase 3) that all
-   run concurrently. On a large graph (50K nodes, real Tel Aviv data), each A* segment takes
-   tens of milliseconds, and the 2× parallelism of Phase 1 + Phase 3 running simultaneously
-   gives a measurable speedup over sequential per-car routing.
+   run concurrently. Each A* segment takes a measurable amount of time on the Tel Aviv graph,
+   and the 2× parallelism of Phase 1 + Phase 3 running simultaneously gives a real speedup
+   over sequential per-car routing.
 
 3. **Cross-section parallelism:** If a batch contains cars going to K different sections,
    K routing workers process them simultaneously (one group per worker), each independently
    running A* under a read lock.
 
-**Scalability on large graphs:**
-On the 6,500-node Tel Aviv graph, each A* call is noticeably more expensive than on a
-2,000-node synthetic graph, making the routing worker count a meaningful bottleneck and
-enabling clearer scaling as workers increase up to the number of physical CPU cores.
-Beyond that, hyper-threading provides diminishing returns, and eventually `pthread_create`
-fails when the OS thread limit is reached (typically ~32,000 threads per process on Linux,
-but performance degrades well before that point due to scheduling overhead).
+**Scalability on larger graphs:**
+On graphs significantly larger than 6,500 nodes, each A* call would become more expensive,
+making the routing worker count a more meaningful bottleneck and enabling clearer scaling up
+to the number of physical CPU cores. Beyond that, hyper-threading provides diminishing returns,
+and eventually `pthread_create` fails when the OS thread limit is reached (typically ~32,000
+threads per process on Linux, but performance degrades well before that point due to scheduling
+overhead).

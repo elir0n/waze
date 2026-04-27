@@ -387,7 +387,7 @@ python3 legacy/load_test.py --num-nodes 6500 --num-edges 12470
 **Key observations:**
 - Throughput is roughly flat 1–8 workers on this graph: 32 clients each send requests **sequentially** (send → wait → send), so the bottleneck is client round-trip time, not routing CPU.
 - The routing worker pool matters most for batch requests and large graphs where each A\* call is CPU-bound for tens of milliseconds.
-- **TASK_REQ** workers now run lock-free (read `_Atomic current_travel_time`) with per-worker pre-allocated scratch buffers — eliminating all per-request `malloc` overhead inside A\*.
+- **TASK_REQ** workers run lock-free (read `_Atomic current_travel_time`) — A\* weight reads require no locks and never stall on traffic updates.
 
 ---
 
@@ -437,4 +437,4 @@ The `data/` volume persists the downloaded graph between restarts.
 
 **Eliron Picard** · **Roy Meiri**
 
-*Parallel & Distributed Programming — 2025*
+*Parallel & Distributed Programming — 2026*
