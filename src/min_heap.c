@@ -4,10 +4,17 @@
 
 MinHeap* createMinHeap(int capacity) {
     MinHeap* minHeap = (MinHeap*) malloc(sizeof(MinHeap));
-    minHeap->pos = (int *)malloc(capacity * sizeof(int));
+    if (!minHeap) return NULL;
     minHeap->size = 0;
     minHeap->capacity = capacity;
+    minHeap->pos   = (int *)malloc(capacity * sizeof(int));
     minHeap->array = (MinHeapNode**) malloc(capacity * sizeof(MinHeapNode*));
+    if (!minHeap->pos || !minHeap->array) {
+        free(minHeap->pos);
+        free(minHeap->array);
+        free(minHeap);
+        return NULL;
+    }
     return minHeap;
 }
 
@@ -95,6 +102,10 @@ int isInMinHeap(MinHeap *minHeap, int node_id) {
 }
 
 void freeMinHeap(MinHeap* minHeap) {
+    if (!minHeap) return;
+    for (int i = 0; i < minHeap->size; i++) {
+        free(minHeap->array[i]);
+    }
     free(minHeap->pos);
     free(minHeap->array);
     free(minHeap);

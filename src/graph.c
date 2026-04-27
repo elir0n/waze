@@ -18,6 +18,7 @@ void graph_init(Graph* g, int num_nodes, int num_edges)
 
     g->num_nodes = num_nodes;
     g->num_edges = num_edges;
+    g->max_speed_limit = 0.0;
 
     /* Allocate global edge table */
     if (num_edges > 0) {
@@ -112,8 +113,11 @@ void graph_add_edge(Graph* g,
     e->lanes = lanes;
     e->is_oneway = is_oneway;
 
-    /* Initial travel time */
-    e->current_travel_time = length / speed_limit;
+    if (speed_limit > g->max_speed_limit)
+        g->max_speed_limit = speed_limit;
+
+    /* Initial travel time in seconds (length metres, speed km/h → /3.6 gives m/s). */
+    e->current_travel_time = length / (speed_limit / 3.6);
 
     /* Initialize historical stats */
     e->ema_travel_time = e->current_travel_time;
@@ -163,19 +167,10 @@ double heuristic(Graph* g, int from_node, int to_node)
     double y = (lat2 - lat1);
     double straight_dist = sqrt(x * x + y * y) * earth_radius_m;
 
-    /* A time-based heuristic: straight-line distance / max speed */
-    double max_speed = 0.0;
-    for (int i = 0; i < g->num_edges; i++) {
-        if (g->edges && g->edges[i].base_speed_limit > max_speed) {
-            max_speed = g->edges[i].base_speed_limit;
-        }
-    }
+    /* A time-based heuristic in seconds: distance (m) / max speed (m/s). */
+    if (g->max_speed_limit > 0.0)
+        return straight_dist / (g->max_speed_limit / 3.6);
 
-    if (max_speed > 0.0) {
-        return straight_dist / max_speed;
-    }
-
-    /* No speed info; fall back to distance */
     return straight_dist;
 }
 

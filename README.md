@@ -67,10 +67,10 @@ python3 legacy/car_client.py --mode sim --cars 50 --steps 200
 
 | Feature | Details |
 |---|---|
-| ⚡ **Concurrent A\* routing** | 8 parallel routing workers under a shared read lock |
+| ⚡ **Concurrent A\* routing** | 8 parallel routing workers; TASK_REQ reads `_Atomic current_travel_time` lock-free |
 | 🔄 **Live traffic ingestion** | EMA-smoothed edge weights updated by car speed reports |
 | 🚗 **30,000 simulated vehicles** | Server-side physics with congestion modeling |
-| 🗺️ **Real-world map** | Tel Aviv OpenStreetMap drive network (~50,000 nodes) |
+| 🗺️ **Real-world map** | Tel Aviv OpenStreetMap drive network (6,500 nodes / 12,470 edges) |
 | 🌐 **Interactive web UI** | Leaflet.js map with car positions, congestion overlays, route planner |
 | 📡 **Line-based JSON protocol** | Simple TCP API compatible with `nc` / curl |
 | 🐳 **Docker Compose** | One-command deployment of the full simulation stack |
@@ -101,7 +101,7 @@ python3 legacy/car_client.py --mode sim --cars 50 --steps 200
 │       │  spawns per-connection threads                       │
 │       ▼                                                      │
 │  Client Threads ──► routing_q ──► ROUTE_WORKERS (×8) ──┐    │
-│                                    [read lock on graph]  │   │
+│                                    [_Atomic reads; lock-free] │   │
 │  Client Threads ──► traffic_q ──► TRAFFIC_WORKERS (×2) ─┤   │
 │                                    [write lock on graph] │   │
 │                                                          ▼   │
@@ -143,8 +143,8 @@ client_thread ──► enqueue Task ──► block on cond_var
 
 1. **Accept thread** — accepts TCP connections; spawns a detached `client_thread_main` per socket.
 2. **Client threads** — parse one request line, create a `Task`, enqueue it, then **block** on the task's condition variable. Guarantees per-connection response ordering with zero busy-waiting.
-3. **Routing workers** (`ROUTE_WORKERS = 8`) — hold a **read lock**; multiple A\* queries execute in parallel.
-4. **Traffic workers** (`TRAFFIC_WORKERS = 2`) — hold a **write lock**; EMA updates are serialized to prevent data races on edge weights.
+3. **Routing workers** (`ROUTE_WORKERS = 8`) — `TASK_REQ` acquires **no lock**; `current_travel_time` is `_Atomic double`, so A\* weight reads are lock-free. `TASK_PRED` uses a **read lock**. Multiple routing workers run simultaneously without blocking each other.
+4. **Traffic workers** (`TRAFFIC_WORKERS = 2`) — hold a **write lock**; EMA updates are serialized to prevent races on `ema_travel_time` and `observation_count`.
 
 ---
 
@@ -348,7 +348,7 @@ Compiler: `gcc -Wall -Wextra -std=c11 -O2`, linked with `-lm -pthread`.
 ### Generating Graph Data
 
 ```bash
-# Real Tel Aviv network (~50,000 nodes) — recommended
+# Real Tel Aviv network (6,500 nodes / 12,470 edges in data/)
 pip install osmnx
 python3 scripts/download_tel_aviv.py --out data/
 
@@ -368,27 +368,26 @@ python3 legacy/car_client.py --mode sim --cars 20 --steps 200 --sim-workers 8
 python3 legacy/car_client.py --mode interactive
 
 # Load test
-python3 legacy/load_test.py --num-nodes 2000 --num-edges 6000
+python3 legacy/load_test.py --num-nodes 6500 --num-edges 12470
 ```
 
 ---
 
 ## 📊 Performance Benchmarks
 
-**Setup**: 2000-node / 6000-edge synthetic graph; 32 concurrent clients × 50 routing requests = 1,600 total queries.
+**Setup**: Tel Aviv OSM graph, 6,500 nodes / 12,470 edges; 32 concurrent REQ clients × 10 rounds, 8 UPD clients × 20 rounds. Run `python3 benchmark.py` to regenerate.
 
-| Route Workers | Throughput (ops/s) | Elapsed (s) | p50 latency (ms) | p99 latency (ms) |
-|:---:|---:|---:|---:|---:|
-| 1 | 202 | 7.90 | 138 | 378 |
-| 2 | **393** | **4.08** | 78 | 123 |
-| 4 | 322 | 4.98 | **55** | 281 |
-| 8 | 148 | 10.80 | 220 | 405 |
+| Route Workers | Throughput (ops/s) | Elapsed (s) | p50 ms | p99 ms | Speedup |
+|:---:|---:|---:|---:|---:|---:|
+| 1 | 82.4 | 19.42 | 393.4 | 610.5 | 1.00× |
+| 2 | 80.5 | 19.87 | 402.8 | 624.1 | 0.98× |
+| 4 | 87.7 | 18.24 | 391.9 | 611.2 | 1.06× |
+| 8 | 81.0 | 19.76 | 399.6 | 620.4 | 0.98× |
 
 **Key observations:**
-- **1 → 2 workers**: ×1.94 throughput — parallel reads under `pthread_rwlock` work correctly with near-linear scaling.
-- **Beyond 2 workers on small graphs**: diminishing returns. Each A\* query on a 2000-node graph completes in microseconds; task-queue mutex contention and thread scheduling overhead dominate.
-- **p50 latency at 4 workers (55 ms)** is lower than at 2 workers (78 ms) — more threads handle bursty load better even when aggregate throughput is similar.
-- On the real Tel Aviv graph (~50,000 nodes), A\* queries are substantially more expensive and additional workers continue to improve throughput.
+- Throughput is roughly flat 1–8 workers on this graph: 32 clients each send requests **sequentially** (send → wait → send), so the bottleneck is client round-trip time, not routing CPU.
+- The routing worker pool matters most for batch requests and large graphs where each A\* call is CPU-bound for tens of milliseconds.
+- **TASK_REQ** workers now run lock-free (read `_Atomic current_travel_time`) with per-worker pre-allocated scratch buffers — eliminating all per-request `malloc` overhead inside A\*.
 
 ---
 

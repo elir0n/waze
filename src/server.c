@@ -29,6 +29,30 @@
 #define MAX_CARS 30000
 #endif
 
+#define MAX_ROUTE_WORKERS 256
+#define SECTION_ROWS       5
+#define SECTION_COLS       5
+#define NUM_SECTIONS      25    /* SECTION_ROWS * SECTION_COLS */
+#define MAX_BATCH         64    /* max cars per batch_routes request */
+#define MAX_SEG_EDGES  16384    /* max edges per A* segment result */
+
+typedef struct {
+    double cost;
+    int*   edges;       /* malloc'd; NULL if no path */
+    int    edge_count;
+} SectionPath;
+
+typedef struct {
+    Graph*            g;
+    pthread_rwlock_t* graph_lock;
+    int               src;
+    int               dst;
+    int*              out_edges;    /* pre-allocated buffer of MAX_SEG_EDGES */
+    int               out_edge_count;
+    double            out_cost;
+    int               rc;
+} SegmentArg;
+
 /* Congestion physics:
  * Road class (0–5) is derived from road_type and controls two parameters:
  *   meters_per_car — physical headway (m) at which the road reaches capacity:
@@ -237,7 +261,9 @@ typedef enum {
     TASK_POSITIONS  = 6,
     TASK_CONGESTION = 7,
     TASK_TICK_ALL   = 8,
-    TASK_REG_ROUTE  = 9
+    TASK_REG_ROUTE     = 9,
+    TASK_PRECOMPUTE    = 11,   /* startup: compute one section→section path */
+    TASK_BATCH_SECTION = 12    /* runtime: process one (src_sec,dst_sec) group */
 } TaskType;
 
 typedef struct Task {
@@ -269,6 +295,17 @@ typedef struct Task {
     /* REG_ROUTE payload */
     int* reg_route_edges;
     int  reg_route_len;
+
+    /* PRECOMPUTE payload */
+    int section_src;
+    int section_dst;
+
+    /* BATCH_SECTION payload */
+    int  batch_size;
+    int* batch_srcs;
+    int* batch_dsts;
+    int* batch_user_ids;
+    int* batch_car_ids;
 
     /* result */
     char* response;     /* malloc'ed string to send back */
@@ -345,6 +382,10 @@ static void task_destroy(Task* t) {
     if (!t) return;
     free(t->response);
     free(t->reg_route_edges);
+    free(t->batch_srcs);
+    free(t->batch_dsts);
+    free(t->batch_user_ids);
+    free(t->batch_car_ids);
     pthread_mutex_destroy(&t->mu);
     pthread_cond_destroy(&t->cv);
     free(t);
@@ -372,7 +413,8 @@ static char* build_route_response(Graph* g, int user_id, int car_id, int src, in
     int rc = find_route_a_star_path(g, src, dst,
                                     &cost,
                                     path_edges, max_edges, &edge_count,
-                                    path_nodes, g->num_nodes, &node_count);
+                                    path_nodes, g->num_nodes, &node_count,
+                                    NULL);
 
     if (rc == 1) {
         free(path_edges);
@@ -423,30 +465,6 @@ static char* build_route_response(Graph* g, int user_id, int car_id, int src, in
     return resp;
 }
 
-static char* apply_update(Graph* g, int user_id, int car_id, int edge_id, double speed) {
-    if (edge_id < 0 || edge_id >= g->num_edges) {
-        return build_error_response("BAD_EDGE", user_id, car_id);
-    }
-    if (speed <= 0.0) {
-        return build_error_response("BAD_SPEED", user_id, car_id);
-    }
-
-    const double min_speed = 1e-6;
-    if (speed < min_speed) speed = min_speed;
-
-    Edge* e = &g->edges[edge_id];
-    const double alpha = (e->observation_count == 0) ? 1.0 : 0.2;
-    double measured = e->base_length / speed;
-
-    e->ema_travel_time = alpha * measured + (1.0 - alpha) * e->ema_travel_time;
-    e->current_travel_time = e->ema_travel_time;
-    e->observation_count++;
-
-    char* ack = (char*)malloc(96);
-    if (!ack) return build_error_response("NO_MEM", user_id, car_id);
-    snprintf(ack, 96, "{\"status\":\"ACK\",\"user_id\":%d,\"car_id\":%d}\n", user_id, car_id);
-    return ack;
-}
 
 static char* build_pred_response(Graph* g, int edge_id) {
     if (edge_id < 0 || edge_id >= g->num_edges) {
@@ -472,9 +490,27 @@ typedef struct {
     TaskQueue routing_q;
     TaskQueue traffic_q;
 
-    pthread_t routing_workers[ROUTE_WORKERS];
+    pthread_t routing_workers[MAX_ROUTE_WORKERS];
     pthread_t traffic_workers[TRAFFIC_WORKERS];
+    int       num_route_workers;
+
+    /* hierarchical section routing */
+    SectionPath section_paths[NUM_SECTIONS][NUM_SECTIONS];
+    int         section_hubs[NUM_SECTIONS];
+    int*        node_sections;   /* node_sections[node_id] = section_id */
+    double      lat_min, lat_max, lon_min, lon_max;
+
+    /* precompute barrier */
+    int             precompute_remaining;
+    pthread_mutex_t precompute_mu;
+    pthread_cond_t  precompute_cv;
 } ServerState;
+
+/* Per-routing-worker argument: shared state + pre-allocated scratch space. */
+typedef struct {
+    ServerState*  st;
+    RouteContext* ctx;
+} RoutingWorkerArg;
 
 /* ---------------- vehicle handlers ---------------- */
 
@@ -499,7 +535,8 @@ static char* handle_register(ServerState* st,
     int rc = find_route_a_star_path(st->g, src, dst,
                                     &cost,
                                     path_edges, max_edges, &edge_count,
-                                    NULL, 0, NULL);
+                                    NULL, 0, NULL,
+                                    NULL);
     pthread_rwlock_unlock(&st->graph_lock);
 
     if (rc == 1) { free(path_edges); return build_error_response("NO_ROUTE",   user_id, car_id); }
@@ -1035,17 +1072,534 @@ static char* handle_tick_all(ServerState* st, double dt)
 
 /* ---------------- worker threads ---------------- */
 
+/* -------- within-group parallel segment thread -------- */
+
+static void* segment_thread_fn(void* arg) {
+    SegmentArg* a = (SegmentArg*)arg;
+    pthread_rwlock_rdlock(a->graph_lock);
+    a->rc = find_route_a_star_path(a->g, a->src, a->dst,
+                                   &a->out_cost,
+                                   a->out_edges, MAX_SEG_EDGES, &a->out_edge_count,
+                                   NULL, 0, NULL,
+                                   NULL);
+    pthread_rwlock_unlock(a->graph_lock);
+    return NULL;
+}
+
+/* Build a route-JSON string from concatenated edge segments.
+ * Returns malloc'd string; caller frees. */
+static char* build_segment_response(int user_id, int car_id,
+                                    int* p1_edges, int p1_len, double p1_cost,
+                                    int* p2_edges, int p2_len, double p2_cost,
+                                    int* p3_edges, int p3_len, double p3_cost)
+{
+    int total = p1_len + p2_len + p3_len;
+    double eta = p1_cost + p2_cost + p3_cost;
+    size_t buf_sz = 128 + (size_t)total * 16;
+    char* resp = (char*)malloc(buf_sz);
+    if (!resp) return build_error_response("NO_MEM", user_id, car_id);
+
+    int n = snprintf(resp, buf_sz,
+                     "{\"user_id\":%d,\"car_id\":%d,\"route_edges\":[", user_id, car_id);
+    int first = 1;
+    for (int i = 0; i < p1_len; i++) {
+        n += snprintf(resp + n, buf_sz - (size_t)n, "%s%d", first ? "" : ",", p1_edges[i]);
+        first = 0;
+    }
+    for (int i = 0; i < p2_len; i++) {
+        n += snprintf(resp + n, buf_sz - (size_t)n, "%s%d", first ? "" : ",", p2_edges[i]);
+        first = 0;
+    }
+    for (int i = 0; i < p3_len; i++) {
+        n += snprintf(resp + n, buf_sz - (size_t)n, "%s%d", first ? "" : ",", p3_edges[i]);
+        first = 0;
+    }
+    snprintf(resp + n, buf_sz - (size_t)n, "],\"eta\":%.3f}\n", eta);
+    return resp;
+}
+
+/* Process one (src_sec, dst_sec) group: spawn 2N threads for Phase1+Phase3
+ * in parallel, look up pre-computed Phase2 highway, combine results.
+ * Returns a malloc'd JSON string: "[route_json_0,...,route_json_N-1]" */
+static char* handle_batch_section(ServerState* st, Task* t) {
+    int N        = t->batch_size;
+    int src_sec  = t->section_src;
+    int dst_sec  = t->section_dst;
+    int hub_src  = st->section_hubs[src_sec];
+    int hub_dst  = st->section_hubs[dst_sec];
+    SectionPath* hw = &st->section_paths[src_sec][dst_sec];
+
+    SegmentArg* args = (SegmentArg*)malloc(2 * (size_t)N * sizeof(SegmentArg));
+    pthread_t*  tids = (pthread_t*)malloc(2 * (size_t)N * sizeof(pthread_t));
+    if (!args || !tids) {
+        free(args); free(tids);
+        return strdup("[{\"error\":\"NO_MEM\"}]\n");
+    }
+
+    /* Allocate output edge buffers and spawn 2N threads */
+    for (int i = 0; i < N; i++) {
+        args[i].g          = st->g;
+        args[i].graph_lock = &st->graph_lock;
+        args[i].src        = t->batch_srcs[i];
+        args[i].dst        = hub_src;
+        args[i].out_edges  = (int*)malloc(MAX_SEG_EDGES * sizeof(int));
+        args[i].out_edge_count = 0;
+        args[i].out_cost   = 0.0;
+        args[i].rc         = -1;
+        pthread_create(&tids[i], NULL, segment_thread_fn, &args[i]);
+
+        args[N + i].g          = st->g;
+        args[N + i].graph_lock = &st->graph_lock;
+        args[N + i].src        = hub_dst;
+        args[N + i].dst        = t->batch_dsts[i];
+        args[N + i].out_edges  = (int*)malloc(MAX_SEG_EDGES * sizeof(int));
+        args[N + i].out_edge_count = 0;
+        args[N + i].out_cost   = 0.0;
+        args[N + i].rc         = -1;
+        pthread_create(&tids[N + i], NULL, segment_thread_fn, &args[N + i]);
+    }
+
+    for (int i = 0; i < 2 * N; i++) pthread_join(tids[i], NULL);
+
+    /* Combine per-car results into JSON array string */
+    size_t total_sz = 64;
+    for (int i = 0; i < N; i++) {
+        int edges_est = args[i].out_edge_count + (hw->edges ? hw->edge_count : 0)
+                        + args[N + i].out_edge_count;
+        total_sz += 128 + (size_t)edges_est * 16;
+    }
+    char* out = (char*)malloc(total_sz);
+    if (!out) {
+        for (int i = 0; i < 2 * N; i++) free(args[i].out_edges);
+        free(args); free(tids);
+        return strdup("[{\"error\":\"NO_MEM\"}]\n");
+    }
+
+    int pos = 0;
+    pos += snprintf(out + pos, total_sz - (size_t)pos, "[");
+    for (int i = 0; i < N; i++) {
+        if (i > 0) pos += snprintf(out + pos, total_sz - (size_t)pos, ",");
+
+        if (args[i].rc != 0 || args[N + i].rc != 0 || !hw->edges) {
+            /* One segment failed — return error for this car */
+            char* err = build_error_response("NO_ROUTE",
+                                             t->batch_user_ids[i], t->batch_car_ids[i]);
+            /* strip trailing newline for embedding in array */
+            int elen = (int)strlen(err);
+            if (elen > 0 && err[elen - 1] == '\n') err[elen - 1] = '\0';
+            pos += snprintf(out + pos, total_sz - (size_t)pos, "%s", err);
+            free(err);
+        } else {
+            char* route = build_segment_response(
+                t->batch_user_ids[i], t->batch_car_ids[i],
+                args[i].out_edges,     args[i].out_edge_count,     args[i].out_cost,
+                hw->edges,             hw->edge_count,              hw->cost,
+                args[N + i].out_edges, args[N + i].out_edge_count, args[N + i].out_cost);
+            /* strip trailing newline */
+            int rlen = (int)strlen(route);
+            if (rlen > 0 && route[rlen - 1] == '\n') route[rlen - 1] = '\0';
+            pos += snprintf(out + pos, total_sz - (size_t)pos, "%s", route);
+            free(route);
+        }
+    }
+    snprintf(out + pos, total_sz - (size_t)pos, "]\n");
+
+    for (int i = 0; i < 2 * N; i++) free(args[i].out_edges);
+    free(args);
+    free(tids);
+    return out;
+}
+
+/* -------- section metadata computation -------- */
+
+static void compute_sections(ServerState* st) {
+    Graph* g = st->g;
+    if (g->num_nodes <= 0) return;
+
+    st->lat_min = st->lat_max = g->nodes[0].lat;
+    st->lon_min = st->lon_max = g->nodes[0].lon;
+    for (int i = 1; i < g->num_nodes; i++) {
+        if (g->nodes[i].lat < st->lat_min) st->lat_min = g->nodes[i].lat;
+        if (g->nodes[i].lat > st->lat_max) st->lat_max = g->nodes[i].lat;
+        if (g->nodes[i].lon < st->lon_min) st->lon_min = g->nodes[i].lon;
+        if (g->nodes[i].lon > st->lon_max) st->lon_max = g->nodes[i].lon;
+    }
+
+    double lat_range = st->lat_max - st->lat_min + 1e-9;
+    double lon_range = st->lon_max - st->lon_min + 1e-9;
+
+    st->node_sections = (int*)malloc((size_t)g->num_nodes * sizeof(int));
+    if (!st->node_sections) return;
+
+    for (int i = 0; i < g->num_nodes; i++) {
+        int row = (int)((g->nodes[i].lat - st->lat_min) / lat_range * SECTION_ROWS);
+        int col = (int)((g->nodes[i].lon - st->lon_min) / lon_range * SECTION_COLS);
+        if (row < 0) row = 0;
+        if (row >= SECTION_ROWS) row = SECTION_ROWS - 1;
+        if (col < 0) col = 0;
+        if (col >= SECTION_COLS) col = SECTION_COLS - 1;
+        st->node_sections[i] = row * SECTION_COLS + col;
+    }
+
+    /* Find hub node per section: closest to section centroid */
+    for (int s = 0; s < NUM_SECTIONS; s++) st->section_hubs[s] = -1;
+
+    double centroid_lat[NUM_SECTIONS], centroid_lon[NUM_SECTIONS];
+    int    sec_count[NUM_SECTIONS];
+    for (int s = 0; s < NUM_SECTIONS; s++) {
+        centroid_lat[s] = centroid_lon[s] = 0.0;
+        sec_count[s] = 0;
+    }
+    for (int i = 0; i < g->num_nodes; i++) {
+        int s = st->node_sections[i];
+        centroid_lat[s] += g->nodes[i].lat;
+        centroid_lon[s] += g->nodes[i].lon;
+        sec_count[s]++;
+    }
+    for (int s = 0; s < NUM_SECTIONS; s++) {
+        if (sec_count[s] > 0) {
+            centroid_lat[s] /= sec_count[s];
+            centroid_lon[s] /= sec_count[s];
+        }
+    }
+    /* For each node, update hub if it's closer to its section centroid */
+    double best_dist[NUM_SECTIONS];
+    for (int s = 0; s < NUM_SECTIONS; s++) best_dist[s] = 1e18;
+    for (int i = 0; i < g->num_nodes; i++) {
+        int s = st->node_sections[i];
+        double dlat = g->nodes[i].lat - centroid_lat[s];
+        double dlon = g->nodes[i].lon - centroid_lon[s];
+        double d = dlat * dlat + dlon * dlon;
+        if (d < best_dist[s]) {
+            best_dist[s] = d;
+            st->section_hubs[s] = i;
+        }
+    }
+}
+
+/* Push all (i,j) precompute tasks to routing_q; returns count pushed. */
+static int push_precompute_tasks(ServerState* st) {
+    int count = 0;
+    for (int i = 0; i < NUM_SECTIONS; i++) {
+        if (st->section_hubs[i] < 0) continue;
+        for (int j = 0; j < NUM_SECTIONS; j++) {
+            if (i == j) continue;
+            if (st->section_hubs[j] < 0) continue;
+
+            Task* t = task_create(st->g, &st->graph_lock, -1);
+            if (!t) continue;
+            t->type        = TASK_PRECOMPUTE;
+            t->src         = st->section_hubs[i];
+            t->dst         = st->section_hubs[j];
+            t->section_src = i;
+            t->section_dst = j;
+            queue_push(&st->routing_q, t);
+            count++;
+        }
+    }
+    return count;
+}
+
+/* -------- batch request handler (called from client thread) -------- */
+
+/* Parse up to MAX_BATCH objects from "batch_routes":[{...},{...},...].
+ * Extracts start_node, destination_node, user_id, car_id into arrays.
+ * Returns count parsed, -1 on failure. */
+static int parse_batch_routes(const char* line,
+                               int* srcs, int* dsts,
+                               int* user_ids, int* car_ids)
+{
+    const char* p = strstr(line, "\"batch_routes\"");
+    if (!p) return -1;
+    p = strchr(p, '[');
+    if (!p) return -1;
+    p++;
+
+    int count = 0;
+    while (*p && *p != ']' && count < MAX_BATCH) {
+        /* Find next '{' */
+        while (*p && *p != '{' && *p != ']') p++;
+        if (*p != '{') break;
+        const char* obj_start = p;
+
+        /* Find matching '}' (no nesting) */
+        const char* obj_end = strchr(p, '}');
+        if (!obj_end) break;
+
+        /* Extract fields from this object */
+        char obj[512];
+        int obj_len = (int)(obj_end - obj_start + 1);
+        if (obj_len >= (int)sizeof(obj)) { p = obj_end + 1; continue; }
+        memcpy(obj, obj_start, (size_t)obj_len);
+        obj[obj_len] = '\0';
+
+        int sn = -1, dn = -1, uid = -1, cid = -1;
+        json_extract_int(obj, "start_node",       &sn);
+        json_extract_int(obj, "destination_node", &dn);
+        json_extract_int(obj, "user_id",           &uid);
+        json_extract_int(obj, "car_id",            &cid);
+
+        if (sn >= 0 && dn >= 0) {
+            srcs[count]     = sn;
+            dsts[count]     = dn;
+            user_ids[count] = uid;
+            car_ids[count]  = cid;
+            count++;
+        }
+        p = obj_end + 1;
+    }
+    return count;
+}
+
+static void handle_batch_route_request(ServerState* st, int client_fd, const char* line) {
+    int srcs[MAX_BATCH], dsts[MAX_BATCH], uids[MAX_BATCH], cids[MAX_BATCH];
+    int total = parse_batch_routes(line, srcs, dsts, uids, cids);
+    if (total <= 0) {
+        send_all(client_fd, "{\"error\":\"BAD_BATCH\"}\n");
+        return;
+    }
+
+    /* Validate node IDs */
+    for (int i = 0; i < total; i++) {
+        if (srcs[i] < 0 || srcs[i] >= st->g->num_nodes ||
+            dsts[i] < 0 || dsts[i] >= st->g->num_nodes) {
+            send_all(client_fd, "{\"error\":\"BAD_NODES\"}\n");
+            return;
+        }
+    }
+
+    /* Group items by (src_sec, dst_sec).  We allow up to NUM_SECTIONS*NUM_SECTIONS groups. */
+    typedef struct {
+        int src_sec, dst_sec;
+        int indices[MAX_BATCH]; /* original indices into srcs/dsts */
+        int count;
+    } Group;
+
+    Group groups[NUM_SECTIONS * NUM_SECTIONS];
+    int   num_groups = 0;
+
+    /* Map (src_sec*NUM_SECTIONS+dst_sec) → group index */
+    int group_map[NUM_SECTIONS * NUM_SECTIONS];
+    for (int k = 0; k < NUM_SECTIONS * NUM_SECTIONS; k++) group_map[k] = -1;
+
+    for (int i = 0; i < total; i++) {
+        int ss = (st->node_sections && srcs[i] < st->g->num_nodes)
+                    ? st->node_sections[srcs[i]] : 0;
+        int ds = (st->node_sections && dsts[i] < st->g->num_nodes)
+                    ? st->node_sections[dsts[i]] : 0;
+        int key = ss * NUM_SECTIONS + ds;
+        if (group_map[key] < 0) {
+            group_map[key] = num_groups;
+            groups[num_groups].src_sec = ss;
+            groups[num_groups].dst_sec = ds;
+            groups[num_groups].count   = 0;
+            num_groups++;
+        }
+        int g_idx = group_map[key];
+        groups[g_idx].indices[groups[g_idx].count++] = i;
+    }
+
+    /* Create one task per group and push to routing_q */
+    Task** tasks = (Task**)malloc((size_t)num_groups * sizeof(Task*));
+    if (!tasks) { send_all(client_fd, "{\"error\":\"NO_MEM\"}\n"); return; }
+
+    for (int g = 0; g < num_groups; g++) {
+        Group* gr = &groups[g];
+        int N = gr->count;
+
+        int ss = gr->src_sec, ds = gr->dst_sec;
+
+        /* Same section or no highway → dispatch as individual TASK_REQ tasks */
+        if (ss == ds || !st->section_paths[ss][ds].edges) {
+            /* We'll handle them as individual TASK_REQs collected into a mini-array.
+             * For simplicity, create N separate tasks and store them in the group slot.
+             * We reuse a single "batch task" that is actually a TASK_BATCH_SECTION
+             * with ss==ds handled in handle_batch_section by falling through to A*. */
+        }
+
+        Task* t = task_create(st->g, &st->graph_lock, -1);
+        if (!t) { tasks[g] = NULL; continue; }
+
+        t->type        = TASK_BATCH_SECTION;
+        t->section_src = ss;
+        t->section_dst = ds;
+        t->batch_size  = N;
+        t->batch_srcs     = (int*)malloc((size_t)N * sizeof(int));
+        t->batch_dsts     = (int*)malloc((size_t)N * sizeof(int));
+        t->batch_user_ids = (int*)malloc((size_t)N * sizeof(int));
+        t->batch_car_ids  = (int*)malloc((size_t)N * sizeof(int));
+
+        if (!t->batch_srcs || !t->batch_dsts || !t->batch_user_ids || !t->batch_car_ids) {
+            task_destroy(t);
+            tasks[g] = NULL;
+            continue;
+        }
+        for (int k = 0; k < N; k++) {
+            int idx = gr->indices[k];
+            t->batch_srcs[k]     = srcs[idx];
+            t->batch_dsts[k]     = dsts[idx];
+            t->batch_user_ids[k] = uids[idx];
+            t->batch_car_ids[k]  = cids[idx];
+        }
+        tasks[g] = t;
+        queue_push(&st->routing_q, t);
+    }
+
+    /* Wait for all group tasks */
+    /* Collect per-car results ordered by original index */
+    /* group task response = JSON array "[r0,r1,...]" for that group's cars */
+    char* car_results[MAX_BATCH];
+    for (int i = 0; i < total; i++) car_results[i] = NULL;
+
+    for (int g = 0; g < num_groups; g++) {
+        if (!tasks[g]) continue;
+        Task* t = tasks[g];
+        pthread_mutex_lock(&t->mu);
+        while (!t->done) pthread_cond_wait(&t->cv, &t->mu);
+        char* resp = t->response;
+        t->response = NULL; /* take ownership */
+        pthread_mutex_unlock(&t->mu);
+
+        /* resp is "[r0,r1,...]" — parse per-car results back out */
+        if (resp) {
+            /* Distribute results to original indices */
+            Group* gr = &groups[g];
+            const char* rp = resp;
+            /* skip '[' */
+            while (*rp && *rp != '[') rp++;
+            if (*rp == '[') rp++;
+            int k = 0;
+            while (*rp && *rp != ']' && k < gr->count) {
+                while (*rp && (*rp == ',' || *rp == ' ')) rp++;
+                if (*rp == ']' || *rp == '\0') break;
+                /* Find end of this JSON object */
+                const char* obj_start = rp;
+                int depth = 0;
+                while (*rp) {
+                    if (*rp == '{') depth++;
+                    else if (*rp == '}') { depth--; if (depth == 0) { rp++; break; } }
+                    rp++;
+                }
+                int idx = gr->indices[k];
+                int len = (int)(rp - obj_start);
+                car_results[idx] = (char*)malloc((size_t)len + 2);
+                if (car_results[idx]) {
+                    memcpy(car_results[idx], obj_start, (size_t)len);
+                    car_results[idx][len]     = '\0';
+                }
+                k++;
+            }
+            free(resp);
+        }
+        task_destroy(t);
+    }
+    free(tasks);
+
+    /* Build final {"results":[...]} */
+    size_t out_sz = 32;
+    for (int i = 0; i < total; i++) out_sz += car_results[i] ? strlen(car_results[i]) + 4 : 24;
+    char* out = (char*)malloc(out_sz);
+    if (!out) {
+        for (int i = 0; i < total; i++) free(car_results[i]);
+        send_all(client_fd, "{\"error\":\"NO_MEM\"}\n");
+        return;
+    }
+
+    int pos = snprintf(out, out_sz, "{\"results\":[");
+    for (int i = 0; i < total; i++) {
+        if (i > 0) pos += snprintf(out + pos, out_sz - (size_t)pos, ",");
+        if (car_results[i]) {
+            pos += snprintf(out + pos, out_sz - (size_t)pos, "%s", car_results[i]);
+            free(car_results[i]);
+        } else {
+            pos += snprintf(out + pos, out_sz - (size_t)pos, "{\"error\":\"FAIL\"}");
+        }
+    }
+    snprintf(out + pos, out_sz - (size_t)pos, "]}\n");
+    send_all(client_fd, out);
+    free(out);
+}
+
 static void* routing_worker_main(void* arg) {
-    ServerState* st = (ServerState*)arg;
+    RoutingWorkerArg* warg = (RoutingWorkerArg*)arg;
+    ServerState*  st  = warg->st;
+    RouteContext* ctx = warg->ctx; /* pre-allocated scratch; may be NULL if alloc failed */
 
     while (1) {
         Task* t = queue_pop(&st->routing_q);
         char* resp = NULL;
 
         if (t->type == TASK_REQ) {
-            pthread_rwlock_rdlock(&st->graph_lock);
-            resp = build_route_response(st->g, t->user_id, t->car_id, t->src, t->dst);
-            pthread_rwlock_unlock(&st->graph_lock);
+            /* current_travel_time is _Atomic — no lock needed for A*. */
+            if (t->src < 0 || t->src >= st->g->num_nodes ||
+                t->dst < 0 || t->dst >= st->g->num_nodes) {
+                resp = build_error_response("BAD_NODES", t->user_id, t->car_id);
+            } else if (ctx) {
+                /* Fast path: use pre-allocated per-worker scratch (no malloc). */
+                double cost = 0.0;
+                int edge_count = 0;
+                int rc = find_route_a_star_path(st->g, t->src, t->dst,
+                                                &cost,
+                                                ctx->path_edges, ctx->capacity, &edge_count,
+                                                NULL, 0, NULL,
+                                                ctx);
+                if (rc == 1) {
+                    resp = build_error_response("NO_ROUTE", t->user_id, t->car_id);
+                } else if (rc != 0 || edge_count < 0 || edge_count > ctx->capacity) {
+                    resp = build_error_response("ROUTE_FAIL", t->user_id, t->car_id);
+                } else {
+                    size_t buf_sz = 128 + (size_t)edge_count * 16;
+                    resp = (char*)malloc(buf_sz);
+                    if (!resp) {
+                        resp = build_error_response("NO_MEM", t->user_id, t->car_id);
+                    } else {
+                        int n = snprintf(resp, buf_sz,
+                                         "{\"user_id\":%d,\"car_id\":%d,\"route_edges\":[",
+                                         t->user_id, t->car_id);
+                        for (int i = 0; i < edge_count && n > 0 && (size_t)n < buf_sz; i++)
+                            n += snprintf(resp + n, buf_sz - (size_t)n,
+                                          "%s%d", (i == 0 ? "" : ","), ctx->path_edges[i]);
+                        if (n > 0 && (size_t)n < buf_sz)
+                            snprintf(resp + n, buf_sz - (size_t)n, "],\"eta\":%.3f}\n", cost);
+                    }
+                }
+            } else {
+                /* Fallback: ctx alloc failed at startup — use per-call malloc. */
+                int max_edges = st->g->num_nodes > 0 ? st->g->num_nodes : 1;
+                int* path_edges = (int*)malloc(sizeof(int) * max_edges);
+                if (!path_edges) {
+                    resp = build_error_response("NO_MEM", t->user_id, t->car_id);
+                } else {
+                    double cost = 0.0;
+                    int edge_count = 0;
+                    int rc = find_route_a_star_path(st->g, t->src, t->dst,
+                                                    &cost,
+                                                    path_edges, max_edges, &edge_count,
+                                                    NULL, 0, NULL,
+                                                    NULL);
+                    if (rc == 1) {
+                        resp = build_error_response("NO_ROUTE", t->user_id, t->car_id);
+                    } else if (rc != 0 || edge_count < 0 || edge_count > max_edges) {
+                        resp = build_error_response("ROUTE_FAIL", t->user_id, t->car_id);
+                    } else {
+                        size_t buf_sz = 128 + (size_t)edge_count * 16;
+                        resp = (char*)malloc(buf_sz);
+                        if (!resp) {
+                            resp = build_error_response("NO_MEM", t->user_id, t->car_id);
+                        } else {
+                            int n = snprintf(resp, buf_sz,
+                                             "{\"user_id\":%d,\"car_id\":%d,\"route_edges\":[",
+                                             t->user_id, t->car_id);
+                            for (int i = 0; i < edge_count && n > 0 && (size_t)n < buf_sz; i++)
+                                n += snprintf(resp + n, buf_sz - (size_t)n,
+                                              "%s%d", (i == 0 ? "" : ","), path_edges[i]);
+                            if (n > 0 && (size_t)n < buf_sz)
+                                snprintf(resp + n, buf_sz - (size_t)n, "],\"eta\":%.3f}\n", cost);
+                        }
+                    }
+                    free(path_edges);
+                }
+            }
 
         } else if (t->type == TASK_PRED) {
             pthread_rwlock_rdlock(&st->graph_lock);
@@ -1073,6 +1627,72 @@ static void* routing_worker_main(void* arg) {
                                          t->reg_route_edges, t->reg_route_len);
             t->reg_route_edges = NULL; /* avoid double-free in task_destroy */
 
+        } else if (t->type == TASK_PRECOMPUTE) {
+            pthread_rwlock_rdlock(&st->graph_lock);
+            {
+                int si = t->section_src, sj = t->section_dst;
+                int* edges = (int*)malloc(MAX_SEG_EDGES * sizeof(int));
+                double cost = 0.0;
+                int edge_count = 0;
+                int rc = 0;
+                if (edges) {
+                    rc = find_route_a_star_path(st->g, t->src, t->dst,
+                                                &cost, edges, MAX_SEG_EDGES,
+                                                &edge_count, NULL, 0, NULL,
+                                                NULL);
+                }
+                if (edges && rc == 0) {
+                    st->section_paths[si][sj].cost       = cost;
+                    st->section_paths[si][sj].edges      = edges;
+                    st->section_paths[si][sj].edge_count = edge_count;
+                } else {
+                    free(edges);
+                    st->section_paths[si][sj].edges = NULL;
+                }
+            }
+            pthread_rwlock_unlock(&st->graph_lock);
+            pthread_mutex_lock(&st->precompute_mu);
+            st->precompute_remaining--;
+            if (st->precompute_remaining == 0)
+                pthread_cond_broadcast(&st->precompute_cv);
+            pthread_mutex_unlock(&st->precompute_mu);
+            /* No client waiting — free task directly */
+            task_destroy(t);
+            continue;
+
+        } else if (t->type == TASK_BATCH_SECTION) {
+            /* handle_batch_section spawns its own threads for phases 1+3.
+             * For same-section pairs (or missing highway), fall back to
+             * individual A* calls per car. */
+            int ss = t->section_src, ds = t->section_dst;
+            if (ss == ds || !st->section_paths[ss][ds].edges) {
+                /* Same section or no precomputed path: direct A* per car */
+                int N = t->batch_size;
+                size_t total_sz = 32;
+                for (int i = 0; i < N; i++) total_sz += 256 + (size_t)st->g->num_nodes * 16;
+                char* out = (char*)malloc(total_sz);
+                int pos = 0;
+                if (out) pos = snprintf(out, total_sz, "[");
+                for (int i = 0; i < N; i++) {
+                    if (i > 0 && out) pos += snprintf(out + pos, total_sz - (size_t)pos, ",");
+                    pthread_rwlock_rdlock(&st->graph_lock);
+                    char* r = build_route_response(st->g,
+                                                   t->batch_user_ids[i], t->batch_car_ids[i],
+                                                   t->batch_srcs[i], t->batch_dsts[i]);
+                    pthread_rwlock_unlock(&st->graph_lock);
+                    if (r && out) {
+                        int rlen = (int)strlen(r);
+                        if (rlen > 0 && r[rlen - 1] == '\n') r[rlen - 1] = '\0';
+                        pos += snprintf(out + pos, total_sz - (size_t)pos, "%s", r);
+                    }
+                    free(r);
+                }
+                if (out) snprintf(out + pos, total_sz - (size_t)pos, "]\n");
+                resp = out;
+            } else {
+                resp = handle_batch_section(st, t);
+            }
+
         } else {
             resp = build_error_response("INTERNAL", t->user_id, t->car_id);
         }
@@ -1087,9 +1707,36 @@ static void* traffic_worker_main(void* arg) {
 
     while (1) {
         Task* t = queue_pop(&st->traffic_q);
+
+        /* Validate before acquiring the write lock (num_edges is immutable). */
+        if (t->edge_id < 0 || t->edge_id >= st->g->num_edges) {
+            task_complete(t, build_error_response("BAD_EDGE", t->user_id, t->car_id));
+            continue;
+        }
+        if (t->speed <= 0.0) {
+            task_complete(t, build_error_response("BAD_SPEED", t->user_id, t->car_id));
+            continue;
+        }
+
+        double speed = t->speed < 1e-6 ? 1e-6 : t->speed;
+
+        /* wrlock serializes concurrent traffic workers on the EMA RMW sequence. */
         pthread_rwlock_wrlock(&st->graph_lock);
-        char* resp = apply_update(st->g, t->user_id, t->car_id, t->edge_id, t->speed);
+        Edge* e = &st->g->edges[t->edge_id];
+        double alpha   = (e->observation_count == 0) ? 1.0 : 0.2;
+        double measured = e->base_length / speed;
+        e->ema_travel_time    = alpha * measured + (1.0 - alpha) * e->ema_travel_time;
+        e->current_travel_time = e->ema_travel_time;
+        e->observation_count++;
         pthread_rwlock_unlock(&st->graph_lock);
+
+        /* Build response after releasing the lock. */
+        char* resp = (char*)malloc(96);
+        if (resp)
+            snprintf(resp, 96, "{\"status\":\"ACK\",\"user_id\":%d,\"car_id\":%d}\n",
+                     t->user_id, t->car_id);
+        else
+            resp = build_error_response("NO_MEM", t->user_id, t->car_id);
 
         task_complete(t, resp);
     }
@@ -1141,8 +1788,14 @@ static void* client_thread_main(void* arg) {
         int flag;
         double dt_val;
 
+        /* --- BATCH_ROUTES: {"batch_routes":[...]} --- */
+        if (strstr(line, "\"batch_routes\"")) {
+            task_destroy(t);
+            handle_batch_route_request(st, client_fd, line);
+            continue;
+
         /* --- REGISTER: {"register_car":1,"user_id":...,"car_id":...,"start_node":...,"destination_node":...} --- */
-        if (json_extract_int(line, "register_car", &flag) && flag &&
+        } else if (json_extract_int(line, "register_car", &flag) && flag &&
             json_extract_int(line, "user_id", &user_id) &&
             json_extract_int(line, "car_id",  &car_id)  &&
             json_extract_int(line, "start_node", &src)  &&
@@ -1280,10 +1933,14 @@ static void* client_thread_main(void* arg) {
 
 /* ---------------- server_run ---------------- */
 
-int server_run(Graph* g, int port) {
+int server_run(Graph* g, int port, int route_workers) {
+    if (route_workers < 1) route_workers = 1;
+    if (route_workers > MAX_ROUTE_WORKERS) route_workers = MAX_ROUTE_WORKERS;
+
     static ServerState st;
     memset(&st, 0, sizeof(st));
     st.g = g;
+    st.num_route_workers = route_workers;
 
     queue_init(&st.routing_q);
     queue_init(&st.traffic_q);
@@ -1300,10 +1957,23 @@ int server_run(Graph* g, int port) {
         return 5;
     }
 
-    /* Start worker pools */
-    for (int i = 0; i < ROUTE_WORKERS; i++) {
-        if (pthread_create(&st.routing_workers[i], NULL, routing_worker_main, &st) != 0) {
-            fprintf(stderr, "pthread_create routing worker failed\n");
+    if (pthread_mutex_init(&st.precompute_mu, NULL) != 0 ||
+        pthread_cond_init(&st.precompute_cv, NULL)  != 0) {
+        fprintf(stderr, "pthread_mutex/cond_init precompute failed\n");
+        return 9;
+    }
+
+    /* Start worker pools — each routing worker gets its own RouteContext. */
+    static RoutingWorkerArg route_wargs[MAX_ROUTE_WORKERS];
+    for (int i = 0; i < route_workers; i++) {
+        route_wargs[i].st  = &st;
+        route_wargs[i].ctx = route_context_create(g->num_nodes);
+        if (!route_wargs[i].ctx)
+            fprintf(stderr, "Warning: routing worker %d: route_context_create failed; "
+                            "falling back to per-request malloc\n", i);
+        if (pthread_create(&st.routing_workers[i], NULL, routing_worker_main,
+                           &route_wargs[i]) != 0) {
+            fprintf(stderr, "pthread_create routing worker %d failed\n", i);
             return 6;
         }
         pthread_detach(st.routing_workers[i]);
@@ -1314,6 +1984,31 @@ int server_run(Graph* g, int port) {
             return 7;
         }
         pthread_detach(st.traffic_workers[i]);
+    }
+
+    /* Compute geographic sections and hub nodes */
+    compute_sections(&st);
+
+    /* Count how many precompute tasks will be pushed, set counter first,
+     * then push (so workers can decrement safely from the start). */
+    {
+        int n_precompute = 0;
+        for (int i = 0; i < NUM_SECTIONS; i++) {
+            if (st.section_hubs[i] < 0) continue;
+            for (int j = 0; j < NUM_SECTIONS; j++) {
+                if (i == j || st.section_hubs[j] < 0) continue;
+                n_precompute++;
+            }
+        }
+        if (n_precompute > 0) {
+            st.precompute_remaining = n_precompute;
+            push_precompute_tasks(&st);
+            pthread_mutex_lock(&st.precompute_mu);
+            while (st.precompute_remaining > 0)
+                pthread_cond_wait(&st.precompute_cv, &st.precompute_mu);
+            pthread_mutex_unlock(&st.precompute_mu);
+            fprintf(stderr, "Precomputed %d section paths.\n", n_precompute);
+        }
     }
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);

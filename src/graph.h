@@ -1,6 +1,7 @@
 #ifndef GRAPH_H
 #define GRAPH_H
 
+#include <stdatomic.h>
 #include <stdlib.h>
 
 #define MAX_NODES 100000
@@ -17,7 +18,7 @@ typedef struct {
     int lanes;
     int is_oneway;
 
-    double current_travel_time;
+    _Atomic double current_travel_time;
     
     double ema_travel_time;
     int observation_count;
@@ -41,6 +42,7 @@ typedef struct {
 
     int num_nodes;
     int num_edges;
+    double max_speed_limit; /* cached after load; used by heuristic() */
 } Graph;
 
 /* Graph API */

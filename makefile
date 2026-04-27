@@ -12,7 +12,7 @@ SRC = \
 
 TARGET = server
 
-.PHONY: all run clean
+.PHONY: all run clean benchmark
 
 all: $(TARGET)
 
@@ -24,3 +24,6 @@ run: $(TARGET)
 
 clean:
 	rm -f $(TARGET)
+
+benchmark: $(TARGET)
+	python3 benchmark.py
