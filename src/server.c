@@ -35,6 +35,9 @@
 #define NUM_SECTIONS      25    /* SECTION_ROWS * SECTION_COLS */
 #define MAX_BATCH         64    /* max cars per batch_routes request */
 #define MAX_SEG_EDGES  16384    /* max edges per A* segment result */
+#define N_TICK_WORKERS     4    /* parallel threads for handle_tick_all second pass */
+#define SEG_WORKERS        8    /* persistent segment worker pool size */
+#define N_EDGE_STRIPES    64    /* striped mutex buckets for traffic EMA updates */
 
 typedef struct {
     double cost;
@@ -42,16 +45,30 @@ typedef struct {
     int    edge_count;
 } SectionPath;
 
+/* SegTask: one A* segment job for the segment worker pool */
+typedef struct SegTask {
+    int              src;
+    int              dst;
+    Graph*           g;
+    int*             out_edges;       /* pre-allocated by caller */
+    int              out_edge_count;
+    double           out_cost;
+    int              rc;
+    int*             pending;         /* atomic counter; decremented on finish */
+    struct SegTask*  next;
+} SegTask;
+
 typedef struct {
-    Graph*            g;
-    pthread_rwlock_t* graph_lock;
-    int               src;
-    int               dst;
-    int*              out_edges;    /* pre-allocated buffer of MAX_SEG_EDGES */
-    int               out_edge_count;
-    double            out_cost;
-    int               rc;
-} SegmentArg;
+    SegTask*        head;
+    SegTask*        tail;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+} SegTaskQueue;
+
+typedef struct {
+    SegTaskQueue*  q;
+    RouteContext*  ctx;
+} SegWorkerArg;
 
 /* Congestion physics:
  * Road class (0–5) is derived from road_type and controls two parameters:
@@ -134,19 +151,22 @@ static void trim_crlf(char* s) {
     }
 }
 
-/* Reads one line ending with '\n' into buf (null-terminated).
-   Returns length, 0 if connection closed, -1 on error. */
-static int recv_line(int client_fd, char* buf, int cap) {
+/* Per-connection receive buffer — amortises recv() syscalls. */
+typedef struct { char data[4096]; int start; int end; } RecvBuf;
+
+/* Buffered line reader: reads up to 4096 bytes at a time, scans for '\n'.
+ * Returns line length (including '\n'), 0 on EOF, -1 on error. */
+static int recv_line(int client_fd, char* buf, int cap, RecvBuf* rb) {
     int pos = 0;
     while (pos < cap - 1) {
-        char c;
-        int r = (int)recv(client_fd, &c, 1, 0);
-        if (r == 0) { /* peer closed */
-            if (pos == 0) return 0;
-            break;
+        if (rb->start >= rb->end) {
+            int r = (int)recv(client_fd, rb->data, sizeof(rb->data), 0);
+            if (r == 0) { if (pos == 0) return 0; break; }
+            if (r < 0)  return -1;
+            rb->start = 0;
+            rb->end   = r;
         }
-        if (r < 0) return -1;
-
+        char c = rb->data[rb->start++];
         buf[pos++] = c;
         if (c == '\n') break;
     }
@@ -391,6 +411,51 @@ static void task_destroy(Task* t) {
     free(t);
 }
 
+/* ---------------- segment worker pool ---------------- */
+
+static void seg_queue_init(SegTaskQueue* q) {
+    q->head = q->tail = NULL;
+    pthread_mutex_init(&q->mu, NULL);
+    pthread_cond_init(&q->cv, NULL);
+}
+
+static void seg_queue_push(SegTaskQueue* q, SegTask* t) {
+    t->next = NULL;
+    pthread_mutex_lock(&q->mu);
+    if (!q->tail) q->head = q->tail = t;
+    else          { q->tail->next = t; q->tail = t; }
+    pthread_cond_signal(&q->cv);
+    pthread_mutex_unlock(&q->mu);
+}
+
+static SegTask* seg_queue_pop(SegTaskQueue* q) {
+    pthread_mutex_lock(&q->mu);
+    while (!q->head) pthread_cond_wait(&q->cv, &q->mu);
+    SegTask* t = q->head;
+    q->head = t->next;
+    if (!q->head) q->tail = NULL;
+    pthread_mutex_unlock(&q->mu);
+    t->next = NULL;
+    return t;
+}
+
+static void* seg_worker_main(void* arg) {
+    SegWorkerArg* wa = (SegWorkerArg*)arg;
+    while (1) {
+        SegTask* t = seg_queue_pop(wa->q);
+        /* No graph_lock needed: current_travel_time is _Atomic;
+         * base_length, speed_limit, road_type, lanes are immutable after load. */
+        t->rc = find_route_a_star_path(t->g, t->src, t->dst,
+                                       &t->out_cost,
+                                       t->out_edges, MAX_SEG_EDGES,
+                                       &t->out_edge_count,
+                                       NULL, 0, NULL,
+                                       wa->ctx);
+        __atomic_fetch_sub(t->pending, 1, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
 /* ---------------- protocol execution (workers) ---------------- */
 
 static char* build_route_response(Graph* g, int user_id, int car_id, int src, int dst) {
@@ -504,6 +569,14 @@ typedef struct {
     int             precompute_remaining;
     pthread_mutex_t precompute_mu;
     pthread_cond_t  precompute_cv;
+
+    /* segment worker pool */
+    SegTaskQueue    seg_q;
+    pthread_t       seg_workers[SEG_WORKERS];
+    SegWorkerArg    seg_wargs[SEG_WORKERS];
+
+    /* per-stripe edge mutexes — replace global graph_lock write lock */
+    pthread_mutex_t edge_stripe_mu[N_EDGE_STRIPES];
 } ServerState;
 
 /* Per-routing-worker argument: shared state + pre-allocated scratch space. */
@@ -918,6 +991,76 @@ static char* handle_register_route(ServerState* st,
     return resp;
 }
 
+typedef struct {
+    ServerState* st;
+    int          start;      /* first vehicle slot (inclusive) */
+    int          end;        /* last vehicle slot (exclusive) */
+    int*         occ;        /* shared occupancy array; use atomic ops for updates */
+    int          num_edges;
+    double       dt;
+} TickArg;
+
+static void* tick_worker_fn(void* arg) {
+    TickArg* a       = (TickArg*)arg;
+    ServerState* st  = a->st;
+    int num_edges    = a->num_edges;
+    int* occ         = a->occ;
+    double dt        = a->dt;
+
+    for (int i = a->start; i < a->end; i++) {
+        VehicleState* v = &st->vehicles.cars[i];
+        if (!v->active || v->state != CAR_DRIVING) continue;
+
+        double remaining_dt = dt;
+        while (v->state == CAR_DRIVING && remaining_dt > 0.0) {
+            if (v->edge_idx >= v->route_len) {
+                v->state = CAR_ARRIVED;
+                break;
+            }
+
+            int eid = v->route_edges[v->edge_idx];
+            double len        = st->g->edges[eid].base_length;
+            double base_speed = st->g->edges[eid].base_speed_limit / 3.6;
+            if (len        <= 0.0) len        = 1.0;
+            if (base_speed <= 0.0) base_speed = 1.0;
+
+            int    cls      = road_class(st->g->edges[eid].road_type);
+            int    capacity = edge_capacity(st->g->edges[eid].base_length,
+                                            st->g->edges[eid].lanes, cls);
+            int    occupancy = (eid >= 0 && eid < num_edges)
+                               ? __atomic_load_n(&occ[eid], __ATOMIC_RELAXED) : 0;
+            double cong = 1.0 - (double)occupancy / (double)capacity;
+            if (cong < jam_floor(cls)) cong = jam_floor(cls);
+            double speed   = base_speed * cong;
+            double advance = (speed * remaining_dt) / len;
+
+            if (v->pos + advance < 1.0) {
+                v->pos += advance;
+                remaining_dt = 0.0;
+            } else {
+                double remaining_frac = 1.0 - v->pos;
+                double time_to_cross  = (remaining_frac * len) / speed;
+                remaining_dt -= time_to_cross;
+
+                if (eid >= 0 && eid < num_edges)
+                    __atomic_fetch_sub(&occ[eid], 1, __ATOMIC_RELAXED);
+
+                v->pos = 0.0;
+                v->edge_idx++;
+
+                if (v->edge_idx >= v->route_len) {
+                    v->state = CAR_ARRIVED;
+                } else {
+                    int neid = v->route_edges[v->edge_idx];
+                    if (neid >= 0 && neid < num_edges)
+                        __atomic_fetch_add(&occ[neid], 1, __ATOMIC_RELAXED);
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 /* Advance ALL active cars by dt seconds in a single call.
  * Pre-computes occupancy array once (O(N)) to avoid O(N²) cost. */
 static char* handle_tick_all(ServerState* st, double dt)
@@ -944,60 +1087,22 @@ static char* handle_tick_all(ServerState* st, double dt)
         }
     }
 
-    /* Tick every active car */
-    for (int i = 0; i < st->vehicles.max_active_slot; i++) {
-        VehicleState* v = &st->vehicles.cars[i];
-        if (!v->active || v->state != CAR_DRIVING) continue;
-
-        double remaining_dt = dt;
-        while (v->state == CAR_DRIVING && remaining_dt > 0.0) {
-            if (v->edge_idx >= v->route_len) {
-                v->state = CAR_ARRIVED;
-                break;
-            }
-
-            int eid = v->route_edges[v->edge_idx];
-            double len        = st->g->edges[eid].base_length;
-            double base_speed = st->g->edges[eid].base_speed_limit / 3.6;
-            if (len        <= 0.0) len        = 1.0;
-            if (base_speed <= 0.0) base_speed = 1.0;
-
-            int    cls      = road_class(st->g->edges[eid].road_type);
-            int    capacity = edge_capacity(st->g->edges[eid].base_length,
-                                            st->g->edges[eid].lanes, cls);
-            int    occupancy = (eid >= 0 && eid < num_edges) ? occ[eid] : 0;
-            double cong = 1.0 - (double)occupancy / (double)capacity;
-            if (cong < jam_floor(cls)) cong = jam_floor(cls);
-            double speed = base_speed * cong;
-
-            double advance = (speed * remaining_dt) / len;
-
-            if (v->pos + advance < 1.0) {
-                v->pos += advance;
-                remaining_dt = 0.0;
-            } else {
-                double remaining_frac = 1.0 - v->pos;
-                double time_to_cross  = (remaining_frac * len) / speed;
-                remaining_dt -= time_to_cross;
-
-                /* Update occupancy: leaving old edge */
-                if (eid >= 0 && eid < num_edges && occ[eid] > 0)
-                    occ[eid]--;
-
-                v->pos = 0.0;
-                v->edge_idx++;
-
-                if (v->edge_idx >= v->route_len) {
-                    v->state = CAR_ARRIVED;
-                } else {
-                    /* Update occupancy: entering new edge */
-                    int neid = v->route_edges[v->edge_idx];
-                    if (neid >= 0 && neid < num_edges)
-                        occ[neid]++;
-                }
-            }
-        }
+    /* Tick every active car — N_TICK_WORKERS threads, non-overlapping ranges */
+    int max_slot = st->vehicles.max_active_slot;
+    pthread_t tick_tids[N_TICK_WORKERS];
+    TickArg   tick_args[N_TICK_WORKERS];
+    int chunk = (max_slot + N_TICK_WORKERS - 1) / N_TICK_WORKERS;
+    for (int w = 0; w < N_TICK_WORKERS; w++) {
+        tick_args[w].st        = st;
+        tick_args[w].start     = w * chunk;
+        tick_args[w].end       = (w + 1) * chunk < max_slot ? (w + 1) * chunk : max_slot;
+        tick_args[w].occ       = occ;
+        tick_args[w].num_edges = num_edges;
+        tick_args[w].dt        = dt;
+        pthread_create(&tick_tids[w], NULL, tick_worker_fn, &tick_args[w]);
     }
+    for (int w = 0; w < N_TICK_WORKERS; w++)
+        pthread_join(tick_tids[w], NULL);
 
     free(occ);
 
@@ -1070,21 +1175,7 @@ static char* handle_tick_all(ServerState* st, double dt)
     return resp;
 }
 
-/* ---------------- worker threads ---------------- */
-
-/* -------- within-group parallel segment thread -------- */
-
-static void* segment_thread_fn(void* arg) {
-    SegmentArg* a = (SegmentArg*)arg;
-    pthread_rwlock_rdlock(a->graph_lock);
-    a->rc = find_route_a_star_path(a->g, a->src, a->dst,
-                                   &a->out_cost,
-                                   a->out_edges, MAX_SEG_EDGES, &a->out_edge_count,
-                                   NULL, 0, NULL,
-                                   NULL);
-    pthread_rwlock_unlock(a->graph_lock);
-    return NULL;
-}
+/* ---------------- worker threads ----------------</ */
 
 /* Build a route-JSON string from concatenated edge segments.
  * Returns malloc'd string; caller frees. */
@@ -1118,8 +1209,9 @@ static char* build_segment_response(int user_id, int car_id,
     return resp;
 }
 
-/* Process one (src_sec, dst_sec) group: spawn 2N threads for Phase1+Phase3
- * in parallel, look up pre-computed Phase2 highway, combine results.
+/* Process one (src_sec, dst_sec) group via the segment worker pool.
+ * Submits 2N SegTasks (Phase1 + Phase3), waits for completion, then
+ * stitches results with the pre-computed Phase2 highway segment.
  * Returns a malloc'd JSON string: "[route_json_0,...,route_json_N-1]" */
 static char* handle_batch_section(ServerState* st, Task* t) {
     int N        = t->batch_size;
@@ -1129,49 +1221,51 @@ static char* handle_batch_section(ServerState* st, Task* t) {
     int hub_dst  = st->section_hubs[dst_sec];
     SectionPath* hw = &st->section_paths[src_sec][dst_sec];
 
-    SegmentArg* args = (SegmentArg*)malloc(2 * (size_t)N * sizeof(SegmentArg));
-    pthread_t*  tids = (pthread_t*)malloc(2 * (size_t)N * sizeof(pthread_t));
-    if (!args || !tids) {
-        free(args); free(tids);
-        return strdup("[{\"error\":\"NO_MEM\"}]\n");
-    }
+    SegTask* tasks = (SegTask*)malloc(2 * (size_t)N * sizeof(SegTask));
+    if (!tasks) return strdup("[{\"error\":\"NO_MEM\"}]\n");
 
-    /* Allocate output edge buffers and spawn 2N threads */
+    /* Shared atomic counter — decremented by each seg worker on finish */
+    int pending = 2 * N;
+
     for (int i = 0; i < N; i++) {
-        args[i].g          = st->g;
-        args[i].graph_lock = &st->graph_lock;
-        args[i].src        = t->batch_srcs[i];
-        args[i].dst        = hub_src;
-        args[i].out_edges  = (int*)malloc(MAX_SEG_EDGES * sizeof(int));
-        args[i].out_edge_count = 0;
-        args[i].out_cost   = 0.0;
-        args[i].rc         = -1;
-        pthread_create(&tids[i], NULL, segment_thread_fn, &args[i]);
+        /* Phase 1: src[i] → hub_src */
+        tasks[i].src           = t->batch_srcs[i];
+        tasks[i].dst           = hub_src;
+        tasks[i].g             = st->g;
+        tasks[i].out_edges     = (int*)malloc(MAX_SEG_EDGES * sizeof(int));
+        tasks[i].out_edge_count = 0;
+        tasks[i].out_cost      = 0.0;
+        tasks[i].rc            = -1;
+        tasks[i].pending       = &pending;
+        seg_queue_push(&st->seg_q, &tasks[i]);
 
-        args[N + i].g          = st->g;
-        args[N + i].graph_lock = &st->graph_lock;
-        args[N + i].src        = hub_dst;
-        args[N + i].dst        = t->batch_dsts[i];
-        args[N + i].out_edges  = (int*)malloc(MAX_SEG_EDGES * sizeof(int));
-        args[N + i].out_edge_count = 0;
-        args[N + i].out_cost   = 0.0;
-        args[N + i].rc         = -1;
-        pthread_create(&tids[N + i], NULL, segment_thread_fn, &args[N + i]);
+        /* Phase 3: hub_dst → dst[i] */
+        tasks[N + i].src           = hub_dst;
+        tasks[N + i].dst           = t->batch_dsts[i];
+        tasks[N + i].g             = st->g;
+        tasks[N + i].out_edges     = (int*)malloc(MAX_SEG_EDGES * sizeof(int));
+        tasks[N + i].out_edge_count = 0;
+        tasks[N + i].out_cost      = 0.0;
+        tasks[N + i].rc            = -1;
+        tasks[N + i].pending       = &pending;
+        seg_queue_push(&st->seg_q, &tasks[N + i]);
     }
 
-    for (int i = 0; i < 2 * N; i++) pthread_join(tids[i], NULL);
+    /* Wait for all 2N tasks — sched_yield keeps this thread cooperative */
+    while (__atomic_load_n(&pending, __ATOMIC_ACQUIRE) > 0)
+        sched_yield();
 
     /* Combine per-car results into JSON array string */
     size_t total_sz = 64;
     for (int i = 0; i < N; i++) {
-        int edges_est = args[i].out_edge_count + (hw->edges ? hw->edge_count : 0)
-                        + args[N + i].out_edge_count;
+        int edges_est = tasks[i].out_edge_count + (hw->edges ? hw->edge_count : 0)
+                        + tasks[N + i].out_edge_count;
         total_sz += 128 + (size_t)edges_est * 16;
     }
     char* out = (char*)malloc(total_sz);
     if (!out) {
-        for (int i = 0; i < 2 * N; i++) free(args[i].out_edges);
-        free(args); free(tids);
+        for (int i = 0; i < 2 * N; i++) free(tasks[i].out_edges);
+        free(tasks);
         return strdup("[{\"error\":\"NO_MEM\"}]\n");
     }
 
@@ -1180,11 +1274,9 @@ static char* handle_batch_section(ServerState* st, Task* t) {
     for (int i = 0; i < N; i++) {
         if (i > 0) pos += snprintf(out + pos, total_sz - (size_t)pos, ",");
 
-        if (args[i].rc != 0 || args[N + i].rc != 0 || !hw->edges) {
-            /* One segment failed — return error for this car */
+        if (tasks[i].rc != 0 || tasks[N + i].rc != 0 || !hw->edges) {
             char* err = build_error_response("NO_ROUTE",
                                              t->batch_user_ids[i], t->batch_car_ids[i]);
-            /* strip trailing newline for embedding in array */
             int elen = (int)strlen(err);
             if (elen > 0 && err[elen - 1] == '\n') err[elen - 1] = '\0';
             pos += snprintf(out + pos, total_sz - (size_t)pos, "%s", err);
@@ -1192,10 +1284,9 @@ static char* handle_batch_section(ServerState* st, Task* t) {
         } else {
             char* route = build_segment_response(
                 t->batch_user_ids[i], t->batch_car_ids[i],
-                args[i].out_edges,     args[i].out_edge_count,     args[i].out_cost,
-                hw->edges,             hw->edge_count,              hw->cost,
-                args[N + i].out_edges, args[N + i].out_edge_count, args[N + i].out_cost);
-            /* strip trailing newline */
+                tasks[i].out_edges,     tasks[i].out_edge_count,     tasks[i].out_cost,
+                hw->edges,              hw->edge_count,               hw->cost,
+                tasks[N+i].out_edges,   tasks[N+i].out_edge_count,   tasks[N+i].out_cost);
             int rlen = (int)strlen(route);
             if (rlen > 0 && route[rlen - 1] == '\n') route[rlen - 1] = '\0';
             pos += snprintf(out + pos, total_sz - (size_t)pos, "%s", route);
@@ -1204,9 +1295,8 @@ static char* handle_batch_section(ServerState* st, Task* t) {
     }
     snprintf(out + pos, total_sz - (size_t)pos, "]\n");
 
-    for (int i = 0; i < 2 * N; i++) free(args[i].out_edges);
-    free(args);
-    free(tids);
+    for (int i = 0; i < 2 * N; i++) free(tasks[i].out_edges);
+    free(tasks);
     return out;
 }
 
@@ -1720,15 +1810,17 @@ static void* traffic_worker_main(void* arg) {
 
         double speed = t->speed < 1e-6 ? 1e-6 : t->speed;
 
-        /* wrlock serializes concurrent traffic workers on the EMA RMW sequence. */
-        pthread_rwlock_wrlock(&st->graph_lock);
+        /* Per-stripe mutex: only edges in the same stripe contend.
+         * current_travel_time is _Atomic so routing workers read it lock-free. */
+        int stripe = t->edge_id % N_EDGE_STRIPES;
+        pthread_mutex_lock(&st->edge_stripe_mu[stripe]);
         Edge* e = &st->g->edges[t->edge_id];
         double alpha   = (e->observation_count == 0) ? 1.0 : 0.2;
         double measured = e->base_length / speed;
-        e->ema_travel_time    = alpha * measured + (1.0 - alpha) * e->ema_travel_time;
+        e->ema_travel_time     = alpha * measured + (1.0 - alpha) * e->ema_travel_time;
         e->current_travel_time = e->ema_travel_time;
         e->observation_count++;
-        pthread_rwlock_unlock(&st->graph_lock);
+        pthread_mutex_unlock(&st->edge_stripe_mu[stripe]);
 
         /* Build response after releasing the lock. */
         char* resp = (char*)malloc(96);
@@ -1748,18 +1840,20 @@ static void* traffic_worker_main(void* arg) {
 typedef struct {
     ServerState* st;
     int client_fd;
+    RecvBuf rb;
 } ClientCtx;
 
 static void* client_thread_main(void* arg) {
     ClientCtx* ctx = (ClientCtx*)arg;
     ServerState* st = ctx->st;
     int client_fd = ctx->client_fd;
+    ctx->rb.start = ctx->rb.end = 0;
 
     fprintf(stderr, "Client connected (fd=%d).\n", client_fd);
 
-    char line[1024];
+    char line[16384]; /* must fit max batch_routes request: 64 pairs ~5 KB */
     while (1) {
-        int r = recv_line(client_fd, line, (int)sizeof(line));
+        int r = recv_line(client_fd, line, (int)sizeof(line), &ctx->rb);
         if (r == 0) break;
         if (r < 0) {
             fprintf(stderr, "recv error (fd=%d): %s\n", client_fd, strerror(errno));
@@ -1957,6 +2051,13 @@ int server_run(Graph* g, int port, int route_workers) {
         return 5;
     }
 
+    for (int i = 0; i < N_EDGE_STRIPES; i++) {
+        if (pthread_mutex_init(&st.edge_stripe_mu[i], NULL) != 0) {
+            fprintf(stderr, "pthread_mutex_init edge stripe %d failed\n", i);
+            return 5;
+        }
+    }
+
     if (pthread_mutex_init(&st.precompute_mu, NULL) != 0 ||
         pthread_cond_init(&st.precompute_cv, NULL)  != 0) {
         fprintf(stderr, "pthread_mutex/cond_init precompute failed\n");
@@ -1984,6 +2085,21 @@ int server_run(Graph* g, int port, int route_workers) {
             return 7;
         }
         pthread_detach(st.traffic_workers[i]);
+    }
+
+    /* Start segment worker pool */
+    seg_queue_init(&st.seg_q);
+    for (int i = 0; i < SEG_WORKERS; i++) {
+        st.seg_wargs[i].q   = &st.seg_q;
+        st.seg_wargs[i].ctx = route_context_create(g->num_nodes);
+        if (!st.seg_wargs[i].ctx)
+            fprintf(stderr, "Warning: seg worker %d: route_context_create failed\n", i);
+        if (pthread_create(&st.seg_workers[i], NULL, seg_worker_main,
+                           &st.seg_wargs[i]) != 0) {
+            fprintf(stderr, "pthread_create seg worker %d failed\n", i);
+            return 7;
+        }
+        pthread_detach(st.seg_workers[i]);
     }
 
     /* Compute geographic sections and hub nodes */

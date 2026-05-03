@@ -24,8 +24,12 @@ RouteContext* route_context_create(int num_nodes)
     ctx->h_key       = (double*)malloc(sizeof(double) * num_nodes);
     ctx->h_pos       = (int*)   malloc(sizeof(int)    * num_nodes);
 
+    ctx->node_gen = (unsigned int*)calloc((size_t)num_nodes, sizeof(unsigned int));
+    ctx->gen      = 0;
+
     if (!ctx->g_score || !ctx->f_score || !ctx->parent || !ctx->node_path ||
-        !ctx->path_edges || !ctx->h_heap || !ctx->h_key || !ctx->h_pos) {
+        !ctx->path_edges || !ctx->h_heap || !ctx->h_key || !ctx->h_pos ||
+        !ctx->node_gen) {
         route_context_free(ctx);
         return NULL;
     }
@@ -43,20 +47,11 @@ void route_context_free(RouteContext* ctx)
     free(ctx->h_heap);
     free(ctx->h_key);
     free(ctx->h_pos);
+    free(ctx->node_gen);
     free(ctx);
 }
 
 /* ── Flat binary min-heap helpers (no per-node malloc) ──────────────────── */
-
-static void fh_reset(RouteContext* ctx, int n)
-{
-    for (int i = 0; i < n; i++) {
-        ctx->h_heap[i] = i;
-        ctx->h_key[i]  = DBL_MAX;
-        ctx->h_pos[i]  = i;
-    }
-    ctx->h_size = n;
-}
 
 static void fh_swap(RouteContext* ctx, int i, int j)
 {
@@ -106,14 +101,6 @@ static int fh_extract_min(RouteContext* ctx, double* out_key)
     }
     ctx->h_pos[root] = ctx->capacity; /* sentinel: extracted */
     return root;
-}
-
-static void fh_decrease_key(RouteContext* ctx, int node_id, double key)
-{
-    int i = ctx->h_pos[node_id];
-    if (i >= ctx->h_size) return; /* already extracted */
-    ctx->h_key[node_id] = key;
-    fh_sift_up(ctx, i);
 }
 
 /* ── Path-finding helpers ─────────────────────────────────────────────────── */
@@ -260,28 +247,30 @@ int find_route_a_star_path(Graph* graph,
         node_path = ctx->node_path;
     }
 
-    /* ── Initialise scores ── */
-    for (int i = 0; i < V; i++) {
-        g_score[i] = DBL_MAX;
-        f_score[i] = DBL_MAX;
-        parent[i]  = -1;
-    }
-
-    g_score[start_id] = 0.0;
-    f_score[start_id] = heuristic(graph, start_id, target_id);
-
     int found = 0;
 
     /* ── Main loop: two code paths (flat heap vs legacy heap) ── */
     if (!ctx_owned) {
-        /* ── Fast path: flat heap, no per-node malloc ── */
-        fh_reset(ctx, V);
-        fh_decrease_key(ctx, start_id, f_score[start_id]);
+        /* ── Fast path: O(1) reset via generation counter ── */
+        ctx->gen++;
+        ctx->h_size = 0;
+
+        /* Initialise start node only */
+        ctx->node_gen[start_id] = ctx->gen;
+        g_score[start_id]       = 0.0;
+        f_score[start_id]       = heuristic(graph, start_id, target_id);
+        parent[start_id]        = -1;
+
+        /* Seed heap with start node */
+        ctx->h_heap[0]       = start_id;
+        ctx->h_pos[start_id] = 0;
+        ctx->h_key[start_id] = f_score[start_id];
+        ctx->h_size          = 1;
 
         while (ctx->h_size > 0) {
             double u_f;
             int u = fh_extract_min(ctx, &u_f);
-            if (u < 0 || u_f == DBL_MAX) break;
+            if (u < 0) break;
 
             if (u == target_id) { found = 1; break; }
 
@@ -291,13 +280,28 @@ int find_route_a_star_path(Graph* graph,
                 if (eid >= 0 && eid < graph->num_edges) {
                     int    v = graph->edges[eid].to_node;
                     double w = get_edge_weight(graph, eid);
-                    if (v >= 0 && v < V && g_score[u] != DBL_MAX) {
+                    if (v >= 0 && v < V) {
+                        int    already_seen = (ctx->node_gen[v] == ctx->gen);
+                        double gv = already_seen ? g_score[v] : DBL_MAX;
                         double tg = g_score[u] + w;
-                        if (tg < g_score[v]) {
+                        if (tg < gv) {
                             g_score[v] = tg;
                             f_score[v] = tg + heuristic(graph, v, target_id);
                             parent[v]  = u;
-                            fh_decrease_key(ctx, v, f_score[v]);
+                            if (!already_seen) {
+                                ctx->node_gen[v] = ctx->gen;
+                                int pos = ctx->h_size++;
+                                ctx->h_heap[pos] = v;
+                                ctx->h_pos[v]    = pos;
+                                ctx->h_key[v]    = f_score[v];
+                                fh_sift_up(ctx, pos);
+                            } else {
+                                int hi = ctx->h_pos[v];
+                                if (hi < ctx->h_size) { /* still in heap */
+                                    ctx->h_key[v] = f_score[v];
+                                    fh_sift_up(ctx, hi);
+                                }
+                            }
                         }
                     }
                 }
@@ -305,7 +309,14 @@ int find_route_a_star_path(Graph* graph,
             }
         }
     } else {
-        /* ── Fallback path: legacy MinHeap ── */
+        /* ── Fallback path: O(V) init, legacy MinHeap ── */
+        for (int i = 0; i < V; i++) {
+            g_score[i] = DBL_MAX;
+            f_score[i] = DBL_MAX;
+            parent[i]  = -1;
+        }
+        g_score[start_id] = 0.0;
+        f_score[start_id] = heuristic(graph, start_id, target_id);
         MinHeap* minHeap = createMinHeap(V);
         if (!minHeap) {
             free(g_score); free(f_score); free(parent); free(node_path);

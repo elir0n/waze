@@ -24,7 +24,9 @@ typedef struct {
     double* h_key;      /* h_key[node_id] = current priority */
     int*    h_pos;      /* h_pos[node_id] = position in h_heap */
     int     h_size;
-    int     capacity;   /* num_nodes at alloc time */
+    int     capacity;       /* num_nodes at alloc time */
+    unsigned int  gen;      /* bumped each A* call; 0 = never used */
+    unsigned int* node_gen; /* node_gen[v]==gen → v is live this call */
 } RouteContext;
 
 RouteContext* route_context_create(int num_nodes);

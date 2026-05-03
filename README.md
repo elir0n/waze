@@ -50,15 +50,21 @@ open http://localhost:8090/map.html
 
 ```bash
 # 1. Download the Tel Aviv road network (once)
-pip install osmnx
+pip install osmnx numpy
 python3 scripts/download_tel_aviv.py --out data/
 
 # 2. Build and run the C server
 make run          # starts listening on TCP port 8080
 
-# 3. Launch simulation clients
-python3 gui/bridge.py &                    # HTTP bridge on port 8090
-python3 legacy/car_client.py --mode sim --cars 50 --steps 200
+# 3. Launch the flow-field simulation (built-in HTTP bridge on port 8090)
+#    First run builds and caches the sector flow fields (~30 s):
+python3 flow_field_driver.py --cars 500 --data-dir data --nx 3 --ny 3
+
+#    Subsequent runs load from cache and start immediately:
+python3 flow_field_driver.py --cars 500 --data-dir data
+
+# Open the live map
+open http://localhost:8090/map.html
 ```
 
 ---
@@ -67,12 +73,16 @@ python3 legacy/car_client.py --mode sim --cars 50 --steps 200
 
 | Feature | Details |
 |---|---|
-| ⚡ **Concurrent A\* routing** | 8 parallel routing workers; TASK_REQ reads `_Atomic current_travel_time` lock-free |
+| 🌊 **Sector flow-field simulation** | Map divided into NX×NY sectors; each has a pre-computed Dijkstra flow field. `flow_field_driver.py` routes 500–1,000+ cars continuously, rerouting around jams in real time |
+| ⚡ **Concurrent A\* routing** | 8 parallel routing workers; TASK_REQ reads `_Atomic current_travel_time` lock-free. Flat binary heap + generation counter gives O(1) scratch-space reset per call |
+| 🔀 **Parallel TICK\_ALL** | Vehicle advancement split across 4 threads (`N_TICK_WORKERS`); edge occupancy transitions use `__atomic_fetch_add/sub` — no mutex required |
+| 📦 **Persistent segment worker pool** | 8 dedicated segment workers (`SEG_WORKERS`) each holding a pre-allocated `RouteContext`; replaces per-batch `pthread_create/join` pairs, eliminating repeated A\* malloc overhead |
+| 🔒 **Striped edge mutex** | 64-bucket stripe mutex (`N_EDGE_STRIPES`) replaces a single global write lock for EMA updates — traffic workers on different edges never contend |
 | 🔄 **Live traffic ingestion** | EMA-smoothed edge weights updated by car speed reports |
-| 🚗 **30,000 simulated vehicles** | Server-side physics with congestion modeling |
+| 🚗 **30,000 simulated vehicles** | Server-side physics with congestion modeling (server capacity) |
 | 🗺️ **Real-world map** | Tel Aviv OpenStreetMap drive network (6,500 nodes / 12,470 edges) |
 | 🌐 **Interactive web UI** | Leaflet.js map with car positions, congestion overlays, route planner |
-| 📡 **Line-based JSON protocol** | Simple TCP API compatible with `nc` / curl |
+| 📡 **Buffered TCP reads** | `RecvBuf` (4 096-byte buffer) batches `recv()` syscalls; replaces one-byte-per-call `recv_line` — cuts per-request syscall count by ~100–500× |
 | 🐳 **Docker Compose** | One-command deployment of the full simulation stack |
 | 🔮 **Travel time prediction** | EMA-based per-edge prediction endpoint |
 
@@ -101,18 +111,22 @@ python3 legacy/car_client.py --mode sim --cars 50 --steps 200
 │       │  spawns per-connection threads                       │
 │       ▼                                                      │
 │  Client Threads ──► routing_q ──► ROUTE_WORKERS (×8) ──┐    │
-│                                    [_Atomic reads; lock-free] │   │
-│  Client Threads ──► traffic_q ──► TRAFFIC_WORKERS (×2) ─┤   │
-│                                    [write lock on graph] │   │
-│                                                          ▼   │
-│                                              Graph (rwlock)  │
-│                                             + Vehicle Reg.   │
+│                                    [_Atomic reads; lock-free]│    │
+│  Client Threads ──► traffic_q ──► TRAFFIC_WORKERS (×2) ─┤    │
+│                                    [striped mutex ×64]   │    │
+│  TASK_BATCH_SECTION ──────────► SEG_WORKERS (×8) ────────┤    │
+│                                    [no lock; per-worker ctx] │    │
+│  TICK_ALL ─────────────────────► TICK_WORKERS (×4) ──────┤    │
+│                                    [atomic occ[] updates] │    │
+│                                                          ▼    │
+│                                              Graph (rwlock)   │
+│                                             + Vehicle Reg.    │
 └──────────────────────────────────────────────────────────────┘
                        │  also TCP (port 8080)
 ┌──────────────────────▼───────────────────────────────────────┐
-│               Simulated Car Clients (Python)                 │
-│     car_client.py / flow_field_driver.py — 500–1000 cars     │
-│     REGISTER → ROUTE → TICK_ALL → traffic reports → loop     │
+│             Flow Field Driver  (Python)                      │
+│         flow_field_driver.py — 500–1,000+ cars               │
+│  sector flow fields → A* routes → TICK_ALL → jam rerouting   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -141,10 +155,66 @@ client_thread ──► enqueue Task ──► block on cond_var
                client_thread sends response
 ```
 
-1. **Accept thread** — accepts TCP connections; spawns a detached `client_thread_main` per socket.
+1. **Accept thread** — accepts TCP connections; spawns a detached `client_thread_main` per socket. Incoming bytes are read with a 4 096-byte `RecvBuf`, cutting per-request syscall count by ~100–500×.
 2. **Client threads** — parse one request line, create a `Task`, enqueue it, then **block** on the task's condition variable. Guarantees per-connection response ordering with zero busy-waiting.
-3. **Routing workers** (`ROUTE_WORKERS = 8`) — `TASK_REQ` acquires **no lock**; `current_travel_time` is `_Atomic double`, so A\* weight reads are lock-free. `TASK_PRED` uses a **read lock**. Multiple routing workers run simultaneously without blocking each other.
-4. **Traffic workers** (`TRAFFIC_WORKERS = 2`) — hold a **write lock**; EMA updates are serialized to prevent races on `ema_travel_time` and `observation_count`.
+3. **Routing workers** (`ROUTE_WORKERS = 8`) — `TASK_REQ` acquires **no lock**; `current_travel_time` is `_Atomic double`, so A\* weight reads are lock-free. Each worker reuses a persistent `RouteContext` (pre-allocated flat binary heap + generation counter) — O(1) reset instead of O(V) memset per call. `TASK_PRED` uses a **read lock**.
+4. **Traffic workers** (`TRAFFIC_WORKERS = 2`) — EMA updates now take a **per-stripe mutex** (1 of 64 buckets keyed by `edge_id % 64`) instead of a single global write lock. Workers updating different edges never block each other.
+5. **Segment workers** (`SEG_WORKERS = 8`) — a dedicated persistent pool services `TASK_BATCH_SECTION` sub-tasks. Each worker holds its own `RouteContext`; tasks are dispatched via `seg_q` and completion tracked with an `_Atomic int` counter. No per-batch `pthread_create/join` pairs.
+6. **Tick workers** (`N_TICK_WORKERS = 4`) — `TICK_ALL` splits the active-vehicle range into 4 non-overlapping chunks processed in parallel; cross-edge occupancy transitions use `__atomic_fetch_add/sub(__ATOMIC_RELAXED)` — correct without a mutex because congestion speed is a heuristic.
+
+---
+
+## 🌊 Flow Field Simulation
+
+`flow_field_driver.py` is the **primary simulation entry point**. It manages hundreds of cars continuously traversing the Tel Aviv road network using sector-based flow fields for scalable destination selection and real-time jam rerouting.
+
+### How it works
+
+```
+Startup (once):
+  ┌─────────────────────────────────────────────────┐
+  │  Divide map into NX × NY geographic sectors     │
+  │  For each sector: run Dijkstra → flow field     │
+  │  (vectors point toward that sector everywhere)  │
+  │  Cache to data/areas_NxN_cs100.npz              │
+  └─────────────────────────────────────────────────┘
+
+Per car:
+  Current position → flow vector → pick nearest
+  node in target sector → A* route via C server →
+  register route → TICK_ALL drives car forward
+
+Every 10 steps:
+  Query CONGESTION → evict cached routes through
+  jammed edges → reroute affected cars from their
+  current GPS position
+```
+
+### Running
+
+```bash
+# First run: builds and caches the 3×3 sector flow fields (~30 s)
+python3 flow_field_driver.py --cars 500 --data-dir data --nx 3 --ny 3
+
+# Subsequent runs: loads from cache, starts immediately
+python3 flow_field_driver.py --cars 500 --data-dir data
+
+# Custom scale
+python3 flow_field_driver.py --cars 1000 --nx 4 --ny 4 --data-dir data
+```
+
+The driver starts a built-in HTTP bridge on port **8090** — no separate `bridge.py` needed. Open `http://localhost:8090/map.html` to see the live map.
+
+### Key flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--cars` | 500 | Number of simulated cars |
+| `--nx` / `--ny` | 3 / 3 | Sector grid dimensions |
+| `--cell-size` | 100.0 | Flow field grid cell size (meters) |
+| `--dt` | 1.0 | Simulation time step (seconds) |
+| `--dwell-min/max` | 5 / 30 | Dwell time after arrival (sim seconds) |
+| `--host` / `--port` | 127.0.0.1 / 8080 | C server address |
 
 ---
 
@@ -179,8 +249,8 @@ waze/
 │   ├── load_test.py              #   Throughput benchmarking tool
 │   └── agents.py                 #   Agent-based car framework
 │
+├── flow_field_driver.py          # *** Main simulation entry point ***
 ├── generate_graph.py             # Synthetic graph generator (for testing)
-├── flow_field_driver.py          # Flow-field simulation entry point
 │
 ├── Dockerfile                    # Multi-stage build (gcc → Python slim)
 ├── docker-compose.yml            # Orchestration: server + sim + bridge
@@ -246,7 +316,7 @@ Up to **30,000 vehicles** stored server-side. `TICK_ALL` pre-computes the occupa
 
 ### A\* Routing
 
-`routing.c` implements A\* with a **binary min-heap** supporting O(log N) decrease-key.
+`routing.c` implements A\* with a **flat binary min-heap** (no per-node allocation) and a **generation counter** for O(1) per-call reset.
 
 | Component | Detail |
 |---|---|
@@ -254,6 +324,9 @@ Up to **30,000 vehicles** stored server-side. `TICK_ALL` pre-computes the occupa
 | **Heuristic** | `h(n) = geo_distance(n, goal) / v_max` — equirectangular, admissible |
 | **Complexity** | O((V + E) log V) |
 | **vs Dijkstra** | Heuristic prunes most of the search space; critical for concurrent load |
+| **Flat heap** | `h_heap[]`, `h_key[]`, `h_pos[]` arrays replace pointer-linked heap nodes; insert + sift-up replaces decrease-key |
+| **Generation counter** | `ctx->gen` incremented each call; `node_gen[v] == gen` checks lazily whether node `v` is live — eliminates the O(V) `memset` that previously preceded every A\* search |
+| **Persistent ctx** | `RouteContext` allocated once per worker at startup; reused across calls with no malloc/free overhead |
 
 Path reconstruction follows parent pointers back from the goal, returning both the **edge-ID path** (for traffic reports) and **node-ID path** (for display).
 
@@ -273,6 +346,8 @@ current_travel_time  ←  T_ema   (next A* query uses this)
 ```
 
 20% weight on new observations: reacts quickly to sustained congestion while filtering transient spikes.
+
+The EMA RMW is protected by a **striped mutex** (`edge_id % N_EDGE_STRIPES`, 64 buckets). Traffic workers updating different edges proceed in parallel; only workers landing on the same stripe ever contend. `current_travel_time` is then written as a C11 `_Atomic double` store — visible to A\* workers without any lock.
 
 ### Congestion Physics
 
@@ -340,8 +415,21 @@ make run          # build + run
 make clean        # remove binary
 
 # Override worker counts at compile time
-make CFLAGS="-Wall -Wextra -std=c11 -O2 -DROUTE_WORKERS=16 -DTRAFFIC_WORKERS=4"
+make CFLAGS="-Wall -Wextra -std=c11 -O2 \
+  -DROUTE_WORKERS=16 \
+  -DTRAFFIC_WORKERS=4 \
+  -DSEG_WORKERS=16 \
+  -DN_TICK_WORKERS=8 \
+  -DN_EDGE_STRIPES=128"
 ```
+
+| Compile-time constant | Default | Effect |
+|---|---|---|
+| `ROUTE_WORKERS` | 8 | Parallel A\* routing threads |
+| `TRAFFIC_WORKERS` | 2 | Traffic EMA update threads |
+| `SEG_WORKERS` | 8 | Persistent batch-section routing threads |
+| `N_TICK_WORKERS` | 4 | Parallel TICK\_ALL threads |
+| `N_EDGE_STRIPES` | 64 | Stripe-mutex buckets for EMA lock granularity |
 
 Compiler: `gcc -Wall -Wextra -std=c11 -O2`, linked with `-lm -pthread`.
 
@@ -363,31 +451,36 @@ python3 generate_graph.py --nodes 1000 --edges 3000 --out data/
 nc 127.0.0.1 8080
 {"start_node": 0, "destination_node": 999, "user_id": 1, "car_id": 1, "timestamp": 0}
 
-# Simulation clients
-python3 legacy/car_client.py --mode sim --cars 20 --steps 200 --sim-workers 8
-python3 legacy/car_client.py --mode interactive
-
-# Load test
-python3 legacy/load_test.py --num-nodes 6500 --num-edges 12470
+# Scalability benchmark (starts/stops server automatically per worker count)
+python3 benchmark.py
 ```
 
 ---
 
 ## 📊 Performance Benchmarks
 
-**Setup**: Tel Aviv OSM graph, 6,500 nodes / 12,470 edges; 32 concurrent REQ clients × 10 rounds, 8 UPD clients × 20 rounds. Run `python3 benchmark.py` to regenerate.
+**Setup**: Tel Aviv OSM graph, 6,500 nodes / 12,470 edges; 32 concurrent REQ clients × 10 rounds, 8 UPD clients × 20 rounds; 1 discarded warmup + median of 3 timed runs per worker count. Machine: WSL2 on Linux 5.15, x86-64. Run `python3 benchmark.py` to regenerate.
 
 | Route Workers | Throughput (ops/s) | Elapsed (s) | p50 ms | p99 ms | Speedup |
 |:---:|---:|---:|---:|---:|---:|
 | 1 | 82.4 | 19.42 | 393.4 | 610.5 | 1.00× |
 | 2 | 80.5 | 19.87 | 402.8 | 624.1 | 0.98× |
+| 3 | 80.0 | 20.01 | 402.4 | 622.6 | 0.97× |
 | 4 | 87.7 | 18.24 | 391.9 | 611.2 | 1.06× |
+| 6 | 80.3 | 19.92 | 404.4 | 634.3 | 0.97× |
 | 8 | 81.0 | 19.76 | 399.6 | 620.4 | 0.98× |
+| 12 | 64.4 | 24.84 | 493.8 | 817.8 | 0.78× |
+| 16 | 60.9 | 26.29 | 532.6 | 818.0 | 0.74× |
+| 20 | 60.5 | 26.43 | 536.2 | 834.6 | 0.73× |
+| 24 | 61.1 | 26.19 | 530.6 | 816.4 | 0.74× |
+| 28 | 60.8 | 26.33 | 534.6 | 813.7 | 0.74× |
+| 32 | 60.6 | 26.41 | 531.8 | 828.0 | 0.74× |
 
 **Key observations:**
-- Throughput is roughly flat 1–8 workers on this graph: 32 clients each send requests **sequentially** (send → wait → send), so the bottleneck is client round-trip time, not routing CPU.
-- The routing worker pool matters most for batch requests and large graphs where each A\* call is CPU-bound for tens of milliseconds.
-- **TASK_REQ** workers run lock-free (read `_Atomic current_travel_time`) — A\* weight reads require no locks and never stall on traffic updates.
+- **1–8 workers: flat throughput.** 32 clients each send requests *sequentially* (send → wait → send), so at most 32 A\* calls are in flight at once. At ~400 ms p50, most time is queue-wait and network round-trip — not routing CPU. Workers are idle most of the time.
+- **12+ workers: throughput drops ~25%.** Once worker count exceeds the natural parallelism of the workload, OS scheduling overhead and contention on the task-queue mutex dominate. Managing idle threads costs more than their routing benefit.
+- **TASK_REQ is always lock-free**: `current_travel_time` is `_Atomic double`, so A\* weight reads never block on traffic updates regardless of worker count.
+- **Where parallelism truly helps**: (1) the 272-path section precompute at startup completes ~8× faster with 8 workers than with 1; (2) batch routing spawns 2N threads per car group — Phase 1 + Phase 3 segments run simultaneously; (3) on larger graphs where each A\* call is CPU-bound for tens of ms, the worker pool becomes the primary throughput lever.
 
 ---
 
@@ -396,17 +489,12 @@ python3 legacy/load_test.py --num-nodes 6500 --num-edges 12470
 ```yaml
 # docker-compose.yml services
 server:      # C routing daemon — downloads OSM graph on first run
-flow-sim:    # Flow-field simulation with 1000 cars (default)
-bridge:      # HTTP bridge (car-sim profile)
-sim:         # Python car simulation (car-sim profile)
+flow-sim:    # Flow-field simulation with 1000 cars + built-in HTTP bridge (port 8090)
 ```
 
 ```bash
 # Full stack (server + flow field simulation + web UI)
 docker compose up --build
-
-# With browser-based per-car simulation
-docker compose --profile car-sim up --build
 
 # Just the server (bring your own client)
 docker compose up server
@@ -420,14 +508,15 @@ The `data/` volume persists the downloaded graph between restarts.
 
 | File | Language | Responsibility |
 |---|---|---|
-| [src/server.c](src/server.c) | C | TCP server, thread pools, vehicle registry, congestion physics |
-| [src/routing.c](src/routing.c) | C | A\* pathfinding with binary min-heap |
+| [flow_field_driver.py](flow_field_driver.py) | Python | **Main simulation entry point** — sector flow fields, car lifecycle, jam rerouting, built-in HTTP bridge |
+| [src/server.c](src/server.c) | C | TCP server, thread pools (routing ×8, traffic ×2, seg ×8, tick ×4), vehicle registry, congestion physics, striped edge mutex, buffered recv |
+| [src/routing.c](src/routing.c) | C | A\* pathfinding with flat binary heap, generation counter, and persistent `RouteContext` |
 | [src/graph.c](src/graph.c) | C | Graph data structure, edge weights, A\* heuristic |
 | [src/graph_loader.c](src/graph_loader.c) | C | CSV parser for nodes/edges, OSM ID remapping |
 | [src/min_heap.c](src/min_heap.c) | C | Binary min-heap with O(log N) decrease-key |
-| [gui/bridge.py](gui/bridge.py) | Python | HTTP↔TCP bridge, background poller, REST API |
 | [gui/map.html](gui/map.html) | JS/HTML | Leaflet.js live map: positions, congestion, route planner |
-| [flow_field/](flow_field/) | Python | Sector-based flow field computation for large-scale sim |
+| [flow_field/](flow_field/) | Python | Sector-based flow field computation (Dijkstra integration + gradient) |
+| [gui/bridge.py](gui/bridge.py) | Python | Standalone HTTP↔TCP bridge (used only without flow_field_driver) |
 | [scripts/download_tel_aviv.py](scripts/download_tel_aviv.py) | Python | OSMnx downloader for real-world graph |
 | [generate_graph.py](generate_graph.py) | Python | Synthetic random graph generator |
 

@@ -387,7 +387,7 @@ class ServerConn:
 
 _route_cache: Dict[Tuple[int, int], List[int]] = {}
 
-# Populated at startup from nodes.csv; used by get_route / register_route
+# Populated at startup from nodes.csv; used by get_routes_batch / register_route
 
 
 def get_route(conn: ServerConn, start: int, dest: int) -> Optional[List[int]]:
@@ -396,8 +396,13 @@ def get_route(conn: ServerConn, start: int, dest: int) -> Optional[List[int]]:
         return _route_cache[key]
 
     # Translate raw node IDs to C-server sequential indices
-    start_idx = _node_to_idx.get(start, start)
-    dest_idx  = _node_to_idx.get(dest,  dest)
+    start_idx = _node_to_idx.get(start)
+    dest_idx  = _node_to_idx.get(dest)
+    if start_idx is None or dest_idx is None:
+        if not hasattr(get_route, "_warned_missing"):
+            get_route._warned_missing = True
+            print(f"[route] node ID not in index: start={start}, dest={dest}", file=sys.stderr)
+        return None
 
     req = json.dumps({
         "start_node": start_idx,
@@ -436,16 +441,84 @@ def evict_jammed_routes(jammed_edges: Set[int]) -> int:
     return len(stale)
 
 
+_MAX_BATCH = 64  # must match server MAX_BATCH
+
+
+def get_routes_batch(
+    conn: ServerConn,
+    pairs: List[Tuple[int, int]],
+) -> Dict[Tuple[int, int], List[int]]:
+    """Route multiple (start, dest) pairs using the server's batch_routes endpoint.
+
+    The server groups pairs by geographic section and runs Phase-1 / Phase-3 A*
+    segments for every car in each group concurrently, so this is substantially
+    faster than N sequential get_route() calls when N > 1.
+
+    Returns {(start_osm_id, dest_osm_id): edge_id_list} for successful routes.
+    Populates _route_cache for all successful routes.
+    """
+    out: Dict[Tuple[int, int], List[int]] = {}
+
+    # Serve cache hits immediately; translate remaining pairs
+    pending: List[Tuple[int, int, int, int]] = []  # (start, dest, start_idx, dest_idx)
+    for start, dest in pairs:
+        key = (start, dest)
+        if key in _route_cache:
+            out[key] = _route_cache[key]
+            continue
+        s_idx = _node_to_idx.get(start)
+        d_idx = _node_to_idx.get(dest)
+        if s_idx is None or d_idx is None:
+            continue
+        pending.append((start, dest, s_idx, d_idx))
+
+    for chunk_start in range(0, len(pending), _MAX_BATCH):
+        chunk = pending[chunk_start : chunk_start + _MAX_BATCH]
+        req = json.dumps({
+            "batch_routes": [
+                {"start_node": si, "destination_node": di, "user_id": 0, "car_id": i}
+                for i, (_, _, si, di) in enumerate(chunk)
+            ]
+        })
+        try:
+            resp_line = conn.request(req)
+            data = json.loads(resp_line)
+        except Exception as exc:
+            print(f"[batch_route] request failed: {exc}", file=sys.stderr)
+            continue
+
+        if "error" in data:
+            print(f"[batch_route] server error: {data['error']}", file=sys.stderr)
+            continue
+
+        for i, result in enumerate(data.get("results", [])):
+            if i >= len(chunk):
+                break
+            start, dest = chunk[i][0], chunk[i][1]
+            edges = result.get("route_edges") if isinstance(result, dict) else None
+            if edges:
+                _route_cache[(start, dest)] = edges
+                out[(start, dest)] = edges
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Register route + tick_all helpers
 # ---------------------------------------------------------------------------
 
 def register_route(conn: ServerConn, car: Car) -> bool:
+    start_idx = _node_to_idx.get(car.cur_node)
+    dest_idx  = _node_to_idx.get(car.dst_node)
+    if start_idx is None or dest_idx is None:
+        print(f"[reg] node ID not in index: cur={car.cur_node}, dst={car.dst_node}",
+              file=sys.stderr)
+        return False
     req = json.dumps({
         "register_route": 1,
         "car_id":      car.car_id,
-        "start_node":  _node_to_idx.get(car.cur_node, car.cur_node),
-        "dest_node":   _node_to_idx.get(car.dst_node, car.dst_node),
+        "start_node":  start_idx,
+        "dest_node":   dest_idx,
         "route_edges": car.route,
     })
     try:
@@ -516,7 +589,7 @@ def handle_jams(
     with _positions_lock:
         pos_map = {p["car_id"]: p for p in _positions_cache["positions"]}
 
-    rerouteed = 0
+    reroute_meta: List[Tuple[Car, int]] = []  # car, new_dest
     for car in cars:
         if car.arrived or car.dwell_until > sim_time:
             continue
@@ -526,8 +599,7 @@ def handle_jams(
         if not dst_area.nodes:
             continue
 
-        # Find the car's actual current node from its reported lat/lon so that
-        # rerouting starts from where the car physically is, not the journey origin.
+        # Snap to nearest actual node from the car's reported position
         pos = pos_map.get(car.car_id)
         if pos:
             nn = nearest_node_to(pos["lat"], pos["lon"])
@@ -535,7 +607,16 @@ def handle_jams(
                 car.cur_node = nn
 
         new_dest = pick_destination(car.cur_node, dst_area, node_to_cell, look_ahead, rng)
-        route = get_route(conn, car.cur_node, new_dest)
+        reroute_meta.append((car, new_dest))
+
+    if not reroute_meta:
+        return
+
+    routes = get_routes_batch(conn, [(c.cur_node, d) for c, d in reroute_meta])
+
+    rerouteed = 0
+    for car, new_dest in reroute_meta:
+        route = routes.get((car.cur_node, new_dest))
         if route:
             car.dst_node = new_dest
             car.route    = route
@@ -912,47 +993,51 @@ def run(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     num_cars = args.cars
     cars: List[Car] = []
-    registered = 0
     attempts = 0
     max_attempts = max(num_cars * 20, 100)
 
-    print(f"[init] Registering {num_cars} cars …")
-    while registered < num_cars and attempts < max_attempts:
-        attempts += 1
-        # Pick a random start area and a different destination area
-        src_aid = rng.choice(routable)
-        dst_candidates = [a for a in routable if a != src_aid]
-        dst_aid = rng.choice(dst_candidates)
+    print(f"[init] Registering {num_cars} cars (batch routing, {_MAX_BATCH} pairs/request) …")
+    while len(cars) < num_cars and attempts < max_attempts:
+        # Build a batch of candidate (start, dest) pairs
+        batch_size = min(_MAX_BATCH, max_attempts - attempts)
+        candidates: List[Tuple[int, int, int, int]] = []  # start, dest, src_aid, dst_aid
+        for _ in range(batch_size):
+            attempts += 1
+            src_aid = rng.choice(routable)
+            dst_aid = rng.choice([a for a in routable if a != src_aid])
+            src_area = area_manager.areas[src_aid]
+            dst_area = area_manager.areas[dst_aid]
+            start = rng.choice(src_area.nodes)
+            dest  = pick_destination(start, dst_area, node_to_cell, args.look_ahead, rng)
+            candidates.append((start, dest, src_aid, dst_aid))
 
-        src_area = area_manager.areas[src_aid]
-        dst_area = area_manager.areas[dst_aid]
+        routes = get_routes_batch(conn, [(s, d) for s, d, _, _ in candidates])
 
-        start = rng.choice(src_area.nodes)
-        dest  = pick_destination(start, dst_area, node_to_cell, args.look_ahead, rng)
+        for start, dest, src_aid, dst_aid in candidates:
+            if len(cars) >= num_cars:
+                break
+            route = routes.get((start, dest))
+            if not route:
+                continue
+            car = Car(
+                car_id=len(cars),
+                cur_node=start,
+                dst_node=dest,
+                cur_area_id=src_aid,
+                dst_area_id=dst_aid,
+                route=route,
+            )
+            if register_route(conn, car):
+                cars.append(car)
 
-        route = get_route(conn, start, dest)
-        if not route:
-            continue
+        if len(cars) < num_cars and attempts % 500 == 0:
+            print(f"[init]   {len(cars)}/{num_cars} cars after {attempts} attempts …")
 
-        car = Car(
-            car_id=registered,
-            cur_node=start,
-            dst_node=dest,
-            cur_area_id=src_aid,
-            dst_area_id=dst_aid,
-            route=route,
-        )
-        if register_route(conn, car):
-            cars.append(car)
-            registered += 1
-        elif attempts % 100 == 0:
-            print(f"[init] register retries: {attempts} attempts, {registered}/{num_cars} cars ready.")
-
-    if registered < num_cars:
-        print(f"[init] WARNING: only {registered}/{num_cars} cars registered after {attempts} attempts.",
+    if len(cars) < num_cars:
+        print(f"[init] WARNING: only {len(cars)}/{num_cars} cars registered after {attempts} attempts.",
               file=sys.stderr)
 
-    print(f"[init] {registered}/{num_cars} cars registered after {attempts} attempts. "
+    print(f"[init] {len(cars)}/{num_cars} cars registered after {attempts} attempts. "
           f"Route cache: {len(_route_cache)} entries.\n")
 
     # ------------------------------------------------------------------
@@ -986,29 +1071,30 @@ def run(args: argparse.Namespace) -> None:
             car.cur_node   = car.dst_node
             car.dwell_until = sim_time + rng.uniform(args.dwell_min, args.dwell_max)
 
-        # ---- Dispatch cars whose dwell has expired ----
-        for car in cars:
-            if not car.arrived or car.dwell_until > sim_time:
-                continue
+        # ---- Dispatch cars whose dwell has expired (batch-routed) ----
+        ready_cars = [c for c in cars if c.arrived and c.dwell_until <= sim_time]
+        if ready_cars:
+            dispatch_meta: List[Tuple[Car, int, int]] = []  # car, dst_aid, dest
+            for car in ready_cars:
+                dst_aid  = rng.choice([a for a in routable if a != car.cur_area_id])
+                dst_area = area_manager.areas[dst_aid]
+                dest     = pick_destination(car.cur_node, dst_area,
+                                            node_to_cell, args.look_ahead, rng)
+                dispatch_meta.append((car, dst_aid, dest))
 
-            dst_candidates = [a for a in routable if a != car.cur_area_id]
-            dst_aid = rng.choice(dst_candidates)
-            dst_area = area_manager.areas[dst_aid]
+            routes = get_routes_batch(conn, [(c.cur_node, d) for c, _, d in dispatch_meta])
 
-            dest  = pick_destination(car.cur_node, dst_area,
-                                     node_to_cell, args.look_ahead, rng)
-            route = get_route(conn, car.cur_node, dest)
-            if not route:
-                car.dwell_until = sim_time + 5.0   # retry after 5 sim-seconds
-                continue
-
-            car.dst_area_id = dst_aid
-            car.dst_node    = dest
-            car.route       = route
-            car.edge_idx    = 0
-            car.arrived     = False
-
-            register_route(conn, car)
+            for car, dst_aid, dest in dispatch_meta:
+                route = routes.get((car.cur_node, dest))
+                if not route:
+                    car.dwell_until = sim_time + 5.0   # retry after 5 sim-seconds
+                    continue
+                car.dst_area_id = dst_aid
+                car.dst_node    = dest
+                car.route       = route
+                car.edge_idx    = 0
+                car.arrived     = False
+                register_route(conn, car)
 
         # ---- Jam check ----
         if step % JAM_CHECK_INTERVAL == 0:
