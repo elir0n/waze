@@ -4,7 +4,7 @@ import random
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 
@@ -22,24 +22,19 @@ def send_line(sock: socket.socket, line: str) -> None:
     sock.sendall(line.encode("utf-8"))
 
 
-def recv_line(sock: socket.socket) -> str:
-    chunks = []
-    while True:
-        b = sock.recv(1)
-        if not b:
-            raise ConnectionError("Server closed connection")
-        chunks.append(b)
-        if b == b"\n":
-            break
-    return b"".join(chunks).decode("utf-8", errors="replace")
+def recv_line(reader) -> str:
+    line = reader.readline()
+    if not line:
+        raise ConnectionError("Server closed connection")
+    return line.decode("utf-8", errors="replace")
 
 
 def send_json(sock: socket.socket, payload: dict) -> None:
     send_line(sock, json.dumps(payload, separators=(",", ":")))
 
 
-def recv_json(sock: socket.socket) -> dict:
-    return json.loads(recv_line(sock).strip())
+def recv_json(reader) -> dict:
+    return json.loads(recv_line(reader).strip())
 
 
 # --------- stats ---------
@@ -51,10 +46,28 @@ class Stats:
     timeouts: int = 0
     other_fail: int = 0
     latencies_ms: Optional[List[float]] = None
+    first_start: Optional[float] = None
+    last_finish: Optional[float] = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
         if self.latencies_ms is None:
             self.latencies_ms = []
+
+    def record_start(self, t: float) -> None:
+        with self.lock:
+            if self.first_start is None or t < self.first_start:
+                self.first_start = t
+
+    def record_finish(self, t: float) -> None:
+        with self.lock:
+            if self.last_finish is None or t > self.last_finish:
+                self.last_finish = t
+
+    def elapsed(self) -> float:
+        if self.first_start is None or self.last_finish is None:
+            return 0.0
+        return max(0.0, self.last_finish - self.first_start)
 
 
 def percentile(xs: List[float], p: float) -> float:
@@ -76,6 +89,9 @@ def req_worker(
     think_ms: int,
     stats: Stats,
     seed: int,
+    fast_validate: bool,
+    summary_only: bool,
+    route_repeats: int,
 ) -> None:
     rnd = random.Random(seed)
     try:
@@ -88,6 +104,7 @@ def req_worker(
     car_id = seed
 
     with sock:
+        reader = sock.makefile("rb", buffering=1024 * 1024)
         for i in range(rounds):
             src = rnd.randrange(0, max(1, num_nodes))
             dst = rnd.randrange(0, max(1, num_nodes))
@@ -98,28 +115,48 @@ def req_worker(
                 "destination_node": dst,
                 "timestamp": float(i),
             }
+            if summary_only:
+                req["summary_only"] = 1
+            if route_repeats > 1:
+                req["route_repeats"] = route_repeats
 
             t0 = time.perf_counter()
+            stats.record_start(t0)
             try:
                 send_json(sock, req)
-                resp = recv_json(sock)
+                line = recv_line(reader)
                 t1 = time.perf_counter()
+                stats.record_finish(t1)
                 stats.latencies_ms.append((t1 - t0) * 1000.0)
 
-                if "error" in resp:
-                    stats.err += 1
-                elif (
-                    resp.get("user_id") == user_id
-                    and resp.get("car_id") == car_id
-                    and isinstance(resp.get("route_edges"), list)
-                    and "eta" in resp
-                ):
-                    stats.ok += 1
+                if fast_validate:
+                    if "\"error\"" in line:
+                        stats.err += 1
+                    elif line.startswith("{\"user_id\":") and "\"eta\":" in line:
+                        stats.ok += 1
+                    else:
+                        stats.other_fail += 1
                 else:
-                    stats.other_fail += 1
+                    resp = json.loads(line.strip())
+                    if "error" in resp:
+                        stats.err += 1
+                    elif (
+                        resp.get("user_id") == user_id
+                        and resp.get("car_id") == car_id
+                        and (
+                            isinstance(resp.get("route_edges"), list)
+                            or isinstance(resp.get("edge_count"), int)
+                        )
+                        and "eta" in resp
+                    ):
+                        stats.ok += 1
+                    else:
+                        stats.other_fail += 1
             except socket.timeout:
+                stats.record_finish(time.perf_counter())
                 stats.timeouts += 1
             except Exception:
+                stats.record_finish(time.perf_counter())
                 stats.other_fail += 1
 
             if think_ms > 0:
@@ -147,6 +184,7 @@ def upd_worker(
     car_id = seed
 
     with sock:
+        reader = sock.makefile("rb", buffering=64 * 1024)
         for i in range(rounds):
             if num_edges <= 0:
                 stats.err += 1
@@ -165,10 +203,12 @@ def upd_worker(
             }
 
             t0 = time.perf_counter()
+            stats.record_start(t0)
             try:
                 send_json(sock, report)
-                resp = recv_json(sock)
+                resp = json.loads(recv_line(reader).strip())
                 t1 = time.perf_counter()
+                stats.record_finish(t1)
                 stats.latencies_ms.append((t1 - t0) * 1000.0)
 
                 if resp.get("status") == "ACK":
@@ -178,8 +218,10 @@ def upd_worker(
                 else:
                     stats.other_fail += 1
             except socket.timeout:
+                stats.record_finish(time.perf_counter())
                 stats.timeouts += 1
             except Exception:
+                stats.record_finish(time.perf_counter())
                 stats.other_fail += 1
 
             if think_ms > 0:
@@ -205,24 +247,33 @@ def main() -> None:
 
     ap.add_argument("--think-ms", type=int, default=0, help="Sleep between commands per client.")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--fast-req-validate", action="store_true",
+                    help="For REQ responses, avoid JSON-decoding full route_edges arrays during timed load.")
+    ap.add_argument("--summary-only", action="store_true",
+                    help="Ask the server to compute each route but return only eta and edge_count.")
+    ap.add_argument("--route-repeats", type=int, default=1,
+                    help="Benchmark knob: run A* this many times per REQ before responding.")
 
     args = ap.parse_args()
 
     print(f"Target: {args.host}:{args.port}")
     print(f"Clients: REQ={args.req_clients} (x{args.req_rounds}), UPD={args.upd_clients} (x{args.upd_rounds})")
     print(f"Graph: nodes={args.num_nodes}, edges={args.num_edges}")
+    print(f"Mode: REQ {'summary-only' if args.summary_only else 'full-route'}, "
+          f"{'fast validation' if args.fast_req_validate else 'JSON parse'}, "
+          f"route_repeats={args.route_repeats}")
 
     req_stats = Stats()
     upd_stats = Stats()
 
     threads: List[threading.Thread] = []
 
-    start = time.perf_counter()
-
     for i in range(args.req_clients):
         t = threading.Thread(
             target=req_worker,
-            args=(args.host, args.port, args.timeout, args.num_nodes, args.req_rounds, args.think_ms, req_stats, args.seed + 1000 + i),
+            args=(args.host, args.port, args.timeout, args.num_nodes, args.req_rounds,
+                  args.think_ms, req_stats, args.seed + 1000 + i,
+                  args.fast_req_validate, args.summary_only, args.route_repeats),
             daemon=True,
         )
         threads.append(t)
@@ -240,14 +291,12 @@ def main() -> None:
     for t in threads:
         t.join()
 
-    end = time.perf_counter()
-    elapsed = end - start
-
     def report(name: str, s: Stats):
         total = s.ok + s.err + s.timeouts + s.other_fail
         lats = s.latencies_ms
         print(f"\n[{name}] total={total} ok={s.ok} err={s.err} timeouts={s.timeouts} other_fail={s.other_fail}")
         if lats:
+            elapsed = s.elapsed()
             print(f"[{name}] latency ms: p50={percentile(lats,50):.2f} p90={percentile(lats,90):.2f} p99={percentile(lats,99):.2f} max={max(lats):.2f}")
             print(f"[{name}] throughput: {total/elapsed:.2f} ops/sec (elapsed {elapsed:.2f}s)")
 

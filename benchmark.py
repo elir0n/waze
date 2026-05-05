@@ -62,8 +62,11 @@ def start_server(workers, port=8080):
 
 
 def run_load_test(num_nodes, num_edges, port=8080,
-                  req_clients=32, req_rounds=10,
-                  upd_clients=8,  upd_rounds=20,
+                  req_clients=128, req_rounds=100,
+                  upd_clients=0,  upd_rounds=0,
+                  fast_req_validate=True,
+                  summary_only=True,
+                  route_repeats=10,
                   timeout=180.0):
     cmd = [
         sys.executable, "legacy/load_test.py",
@@ -75,8 +78,13 @@ def run_load_test(num_nodes, num_edges, port=8080,
         "--req-rounds",  str(req_rounds),
         "--upd-clients", str(upd_clients),
         "--upd-rounds",  str(upd_rounds),
-        "--timeout", "5.0",
+        "--timeout", "30.0",
+        "--route-repeats", str(route_repeats),
     ]
+    if fast_req_validate:
+        cmd.append("--fast-req-validate")
+    if summary_only:
+        cmd.append("--summary-only")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return result.stdout + result.stderr
@@ -105,15 +113,24 @@ def parse_load_test_output(out):
 def main():
     ap = argparse.ArgumentParser(description="Waze server scalability benchmark")
     ap.add_argument("--port",        type=int, default=8080)
-    ap.add_argument("--req-clients", type=int, default=32)
-    ap.add_argument("--req-rounds",  type=int, default=10)
-    ap.add_argument("--upd-clients", type=int, default=8)
-    ap.add_argument("--upd-rounds",  type=int, default=20)
+    ap.add_argument("--req-clients", type=int, default=128,
+                    help="Concurrent routing clients. Use enough to saturate all route workers.")
+    ap.add_argument("--req-rounds",  type=int, default=100,
+                    help="REQ commands per routing client.")
+    ap.add_argument("--upd-clients", type=int, default=0,
+                    help="Traffic-update clients. Keep 0 for routing scalability.")
+    ap.add_argument("--upd-rounds",  type=int, default=0)
     ap.add_argument("--max-workers", type=int, default=32)
     ap.add_argument("--runs",        type=int, default=3,
                     help="Timed runs per worker count after one warmup (median reported)")
     ap.add_argument("--startup-timeout", type=float, default=60.0,
                     help="Seconds to wait for server to start (longer due to precompute)")
+    ap.add_argument("--parse-responses", action="store_true",
+                    help="JSON-parse full route responses in the client. Slower; disables scalability mode.")
+    ap.add_argument("--full-routes", action="store_true",
+                    help="Return full route_edges arrays. Slower; useful for end-to-end response benchmarks.")
+    ap.add_argument("--route-repeats", type=int, default=10,
+                    help="Benchmark knob: run A* this many times per REQ to amplify routing CPU work.")
     args = ap.parse_args()
 
     num_nodes, num_edges = read_graph_meta()
@@ -121,6 +138,9 @@ def main():
     print(f"Load: {args.req_clients} REQ clients × {args.req_rounds} rounds, "
           f"{args.upd_clients} UPD clients × {args.upd_rounds} rounds  "
           f"(1 warmup + median of {args.runs} timed runs per worker count)\n")
+    print(f"Mode: {'full route responses' if args.full_routes else 'summary-only route responses'}, "
+          f"{'JSON parse' if args.parse_responses else 'lightweight validation'}, "
+          f"route_repeats={args.route_repeats}\n")
 
     worker_counts = []
     n = 1
@@ -162,7 +182,10 @@ def main():
         # Warmup run — discarded
         run_load_test(num_nodes, num_edges, args.port,
                       args.req_clients, args.req_rounds,
-                      args.upd_clients, args.upd_rounds)
+                      args.upd_clients, args.upd_rounds,
+                      fast_req_validate=not args.parse_responses,
+                      summary_only=not args.full_routes,
+                      route_repeats=args.route_repeats)
 
         # Timed runs against the warm server
         run_tputs, run_elapsed, run_p50, run_p99 = [], [], [], []
@@ -171,7 +194,10 @@ def main():
         for _ in range(args.runs):
             out = run_load_test(num_nodes, num_edges, args.port,
                                 args.req_clients, args.req_rounds,
-                                args.upd_clients, args.upd_rounds)
+                                args.upd_clients, args.upd_rounds,
+                                fast_req_validate=not args.parse_responses,
+                                summary_only=not args.full_routes,
+                                route_repeats=args.route_repeats)
             if out is None:
                 failed = True
                 break

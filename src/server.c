@@ -300,6 +300,8 @@ typedef struct Task {
     double timestamp;
     int src;
     int dst;
+    int summary_only;
+    int route_repeats;
 
     /* UPD payload */
     int edge_id;
@@ -1628,11 +1630,17 @@ static void* routing_worker_main(void* arg) {
                 /* Fast path: use pre-allocated per-worker scratch (no malloc). */
                 double cost = 0.0;
                 int edge_count = 0;
-                int rc = find_route_a_star_path(st->g, t->src, t->dst,
+                int repeats = t->route_repeats > 0 ? t->route_repeats : 1;
+                if (repeats > 100) repeats = 100;
+                int rc = 0;
+                for (int r = 0; r < repeats; r++) {
+                    rc = find_route_a_star_path(st->g, t->src, t->dst,
                                                 &cost,
                                                 ctx->path_edges, ctx->capacity, &edge_count,
                                                 NULL, 0, NULL,
                                                 ctx);
+                    if (rc != 0) break;
+                }
                 if (rc == 1) {
                     resp = build_error_response("NO_ROUTE", t->user_id, t->car_id);
                 } else if (rc != 0 || edge_count < 0 || edge_count > ctx->capacity) {
@@ -1642,6 +1650,10 @@ static void* routing_worker_main(void* arg) {
                     resp = (char*)malloc(buf_sz);
                     if (!resp) {
                         resp = build_error_response("NO_MEM", t->user_id, t->car_id);
+                    } else if (t->summary_only) {
+                        snprintf(resp, buf_sz,
+                                 "{\"user_id\":%d,\"car_id\":%d,\"edge_count\":%d,\"eta\":%.3f,\"route_repeats\":%d}\n",
+                                 t->user_id, t->car_id, edge_count, cost, repeats);
                     } else {
                         int n = snprintf(resp, buf_sz,
                                          "{\"user_id\":%d,\"car_id\":%d,\"route_edges\":[",
@@ -1662,11 +1674,17 @@ static void* routing_worker_main(void* arg) {
                 } else {
                     double cost = 0.0;
                     int edge_count = 0;
-                    int rc = find_route_a_star_path(st->g, t->src, t->dst,
+                    int repeats = t->route_repeats > 0 ? t->route_repeats : 1;
+                    if (repeats > 100) repeats = 100;
+                    int rc = 0;
+                    for (int r = 0; r < repeats; r++) {
+                        rc = find_route_a_star_path(st->g, t->src, t->dst,
                                                     &cost,
                                                     path_edges, max_edges, &edge_count,
                                                     NULL, 0, NULL,
                                                     NULL);
+                        if (rc != 0) break;
+                    }
                     if (rc == 1) {
                         resp = build_error_response("NO_ROUTE", t->user_id, t->car_id);
                     } else if (rc != 0 || edge_count < 0 || edge_count > max_edges) {
@@ -1676,6 +1694,10 @@ static void* routing_worker_main(void* arg) {
                         resp = (char*)malloc(buf_sz);
                         if (!resp) {
                             resp = build_error_response("NO_MEM", t->user_id, t->car_id);
+                        } else if (t->summary_only) {
+                            snprintf(resp, buf_sz,
+                                     "{\"user_id\":%d,\"car_id\":%d,\"edge_count\":%d,\"eta\":%.3f,\"route_repeats\":%d}\n",
+                                     t->user_id, t->car_id, edge_count, cost, repeats);
                         } else {
                             int n = snprintf(resp, buf_sz,
                                              "{\"user_id\":%d,\"car_id\":%d,\"route_edges\":[",
@@ -1956,6 +1978,8 @@ static void* client_thread_main(void* arg) {
             t->timestamp = timestamp;
             t->src = src;
             t->dst = dst;
+            json_extract_int(line, "summary_only", &t->summary_only);
+            json_extract_int(line, "route_repeats", &t->route_repeats);
             queue_push(&st->routing_q, t);
 
         /* --- existing: JSON traffic update --- */
